@@ -2,6 +2,12 @@
 
 > 新记录写在最上面。每次修改前先读本文件，修改后追加一条。规则见 `AGENTS.md`。
 
+## 2026-11-14 17:40（来源：Codex 应用）
+- 改动内容：连接 GitHub origin 并接续远端 main 历史，保留本地文件与业务数据；配置 main 跟踪 origin/main；新增应用 / CLI 每次完成调整后检查、中文提交并推送的共享规则及维护说明；保留完整本地忽略规则。此前 GitHub v1.0.0 已发布并核验源码包。
+- 涉及文件：`AGENTS.md`、`README.md`、`.gitignore`、`CHANGELOG.md`（远端及分支跟踪为本机 Git 配置）
+- 测试情况：npm test 6 项通过；已获取远端历史；推送 dry-run 未通过本机认证，未实际推送；待提交文件排除业务数据、上传图片及凭据。
+- 未完成 / 待办：本次提交需在本机完成 GitHub 推送登录后同步；浏览器图文交互及 Windows / Linux 实机验收仍待完成。
+
 ## 2026-11-14 16:20（来源：Codex 应用）
 - 改动内容：准备 GitHub 源码开源版；新增 GPL-3.0-or-later 许可证及第三方组件说明，补充通用 ZIP 下载、npm ci 安装、Windows / macOS / Linux 启动与升级说明；完善忽略规则以排除业务数据、上传图片、依赖、生成资源及本机配置；初始化本地 Git 仓库，未提交或上传。
 - 涉及文件：`README.md`、`LICENSE`、`THIRD_PARTY_NOTICES.md`、`package.json`、`package-lock.json`、`.gitignore`、`CHANGELOG.md`

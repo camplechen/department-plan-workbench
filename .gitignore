@@ -1,12 +1,19 @@
+# 本地业务数据及上传图片
 /data/
+
+# 安装依赖及自动生成资源
 /node_modules/
 /public/vendor/
 /public/rich-text.js
+
+# 本机配置及凭据
 .env
 .env.*
 .npmrc
 *.pem
 *.key
+
+# 日志及系统文件
 *.log
 .DS_Store
 Thumbs.db
