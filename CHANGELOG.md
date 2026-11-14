@@ -2,6 +2,12 @@
 
 > 新记录写在最上面。每次修改前先读本文件，修改后追加一条。规则见 `AGENTS.md`。
 
+## 2026-11-14 18:42（来源：Codex 应用）
+- 改动内容：新增登录与管理员用户管理（分配账号、角色、启停、重置密码、删除），不提供注册；使用随机盐 scrypt 密码哈希和 SQLite 会话，HttpOnly / SameSite Cookie 保持 30 天，退出、过期或账号变更撤销会话，限制连续失败登录；全部业务数据改为 SQLite 关系表和事务，图片保留本地路径；首次事务迁移旧 JSON 并改名保留原始备份，失败回滚且后续不重复导入；提升运行要求到 Node.js 22.13+，无新增 npm 依赖。按用户最新要求将协作规则同步为仅明确指令时代为推送。
+- 涉及文件：`server.js`、`src/database.js`、`public/login.html`、`public/login.js`、`public/index.html`、`public/app.js`、`public/style.css`、`package.json`、`package-lock.json`、`test/auth.test.js`、`test/workbench.test.js`、`.gitignore`、`README.md`、`AGENTS.md`、`CHANGELOG.md`
+- 测试情况：npm test 全部通过（9 项，0 失败），覆盖会话持久化 / 退出 / 过期 / 登录限流 / 用户管理与权限 / 密码重置 / 停用删除 / JSON 事务迁移与回滚 / 旧数据顺序关联 / 计划依据与图片；JavaScript 语法及 git diff --check 通过；独立预览浏览器验证登录、用户管理列表与分配表单、退出；原 3210 服务已备份后重启，新入口实际验证跳转登录，真实数据库完整性与迁移数量核验通过。
+- 未完成 / 待办：按用户要求暂不推送 GitHub，也不发布新版本；细分数据权限后续补充；Windows / Linux 实机验收未执行。升级前完整数据备份位于本机 `data/backups/`，运行不再读写 JSON；回退到旧版代码时须一并恢复旧版数据备份。
+
 ## 2026-11-14 17:40（来源：Codex 应用）
 - 改动内容：连接 GitHub origin 并接续远端 main 历史，保留本地文件与业务数据；配置 main 跟踪 origin/main；新增应用 / CLI 每次完成调整后检查、中文提交并推送的共享规则及维护说明；保留完整本地忽略规则。此前 GitHub v1.0.0 已发布并核验源码包。
 - 涉及文件：`AGENTS.md`、`README.md`、`.gitignore`、`CHANGELOG.md`（远端及分支跟踪为本机 Git 配置）

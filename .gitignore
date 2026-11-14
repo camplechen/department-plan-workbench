@@ -17,3 +17,9 @@
 *.log
 .DS_Store
 Thumbs.db
+
+# SQLite 数据库及事务辅助文件
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*

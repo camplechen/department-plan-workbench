@@ -1,16 +1,18 @@
 import {sanitizeHTML,plainText,hasText,hasContent} from './rich-text.js';
 import {richField,setupEditors,destroyEditors,readEditors} from './rich-editor.js';
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let db={plans:[],bases:[]},view='plans',grouped=false,editing=null;
+let db={plans:[],bases:[]},view='plans',grouped=false,editing=null,currentUser=null,users=[],editingUser=null;
 const today=()=>new Date().toLocaleDateString('en-CA');
 const overdue=p=>p.due<today()&&!['已完成','已暂停'].includes(p.status);
 const badge=p=>`<span class="badge ${overdue(p)?'red':p.status==='已完成'?'green':p.status==='草稿'||p.status==='已暂停'?'gray':''}">${overdue(p)?'已逾期':esc(p.status)}</span>`;
 function toast(t){$('#toast').textContent=t;$('#toast').style.display='block';setTimeout(()=>$('#toast').style.display='none',3000);}
-async function api(url,method='GET',data){const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},...(data?{body:JSON.stringify(data)}:{})});const v=await r.json();if(!r.ok)throw Error(v.error);return v;}
-async function load(){db=await api('/api/data');render();}
+async function api(url,method='GET',data){const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},...(data?{body:JSON.stringify(data)}:{})});const v=await r.json();if(r.status===401){location.replace('/login');throw Error('登录已失效，请重新登录');}if(!r.ok)throw Error(v.error);return v;}
+async function load(){db=await api('/api/data');if(currentUser?.role==='admin')users=await api('/api/users');render();}
 const opts=(items,current)=>items.map(x=>`<option ${x===current?'selected':''}>${esc(x)}</option>`).join('');
 function render(){
- const isPlan=view==='plans';$('#page-title').textContent=isPlan?'部门工作计划':'制定依据库';$('#subtitle').textContent=isPlan?'把部门目标转化为行动，让制定依据与计划紧密相连。':'沉淀目标、数据与要求，为每一项计划提供清晰的依据。';$('#create').textContent=isPlan?'＋ 新建计划':'＋ 新建依据';
+ $('#stats').hidden=view==='users';$('.tabs').hidden=view==='users';$('.filters').hidden=view==='users';$('#export').hidden=view==='users';
+ if(view==='users'){renderUsers();return;}
+ const isPlan=view==='plans';$('#breadcrumb').textContent='工作台 / '+(isPlan?'部门工作计划':'制定依据库');$('#page-title').textContent=isPlan?'部门工作计划':'制定依据库';$('#subtitle').textContent=isPlan?'把部门目标转化为行动，让制定依据与计划紧密相连。':'沉淀目标、数据与要求，为每一项计划提供清晰的依据。';$('#create').textContent=isPlan?'＋ 新建计划':'＋ 新建依据';
  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
  const stats=isPlan?[[db.plans.length,'全部计划','部门行动总览','▦'],[db.plans.filter(p=>p.status==='进行中').length,'进行中','正在推进的工作','◷'],[db.plans.filter(p=>p.status==='已完成').length,'已完成','已达成的工作目标','✓'],[db.plans.filter(overdue).length,'已逾期','需要及时关注','!']]:[[db.bases.length,'全部依据','部门计划知识沉淀','▤'],[new Set(db.bases.map(b=>b.category)).size,'依据分类','多维度梳理计划来源','◇'],[db.bases.filter(b=>db.plans.some(p=>p.basisIds.includes(b.id))).length,'已关联依据','已转化为行动的依据','↗'],[db.bases.filter(b=>!db.plans.some(p=>p.basisIds.includes(b.id))).length,'待关联依据','可进一步制定计划','＋']];
  $('#stats').innerHTML=stats.map(([n,t,s,i])=>`<div class="stat"><span class="symbol">${i}</span><small>${t}</small><strong>${n}</strong><em>${s}</em></div>`).join('');
@@ -45,7 +47,36 @@ $('#form').onsubmit=async e=>{
  await api('/api/'+editing.type+(editing.id?'/'+editing.id:''),editing.id?'PUT':'POST',data);await load();$('#editor').close();toast('已保存');
  }catch(error){$('#form-error').textContent=error.message;}finally{button.disabled=false;}
 };
-document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.hasAttribute('data-close'))b.closest('dialog').close();if(b.dataset.view){view=b.dataset.view;$('#search').value='';$('#status').value='';$('#category').value='';$('#department').value='';render();}if(b.id==='create'||b.hasAttribute('data-new'))edit(view);if(b.dataset.edit)edit(b.dataset.type,b.dataset.edit);if(b.dataset.detail)detail(b.dataset.type,b.dataset.detail);if(b.dataset.related)detail('plans',b.dataset.related);if(b.dataset.plan)edit('plans',null,b.dataset.plan);if(b.dataset.delete&&confirm('确定删除这条记录吗？删除后无法恢复。')){try{await api('/api/'+b.dataset.type+'/'+b.dataset.delete,'DELETE');await load();toast('已删除');}catch(e){toast(e.message);}}});
+document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.hasAttribute('data-close'))b.closest('dialog').close();if(b.dataset.view){view=b.dataset.view;$('#search').value='';$('#status').value='';$('#category').value='';$('#department').value='';render();}if(b.id==='create'||b.hasAttribute('data-new')){if(view==='users')editUser();else edit(view);}if(b.dataset.edit)edit(b.dataset.type,b.dataset.edit);if(b.dataset.detail)detail(b.dataset.type,b.dataset.detail);if(b.dataset.related)detail('plans',b.dataset.related);if(b.dataset.plan)edit('plans',null,b.dataset.plan);if(b.dataset.delete&&confirm('确定删除这条记录吗？删除后无法恢复。')){try{await api('/api/'+b.dataset.type+'/'+b.dataset.delete,'DELETE');await load();toast('已删除');}catch(e){toast(e.message);}}});
 $('#all-tab').onclick=()=>{grouped=false;render();};$('#group-tab').onclick=()=>{grouped=true;render();};['search','status','department','category'].forEach(id=>$('#'+id).addEventListener(id==='search'?'input':'change',render));
 $('#export').onclick=()=>{const is=view==='plans';const rows=is?[['计划名称','部门','负责人','开始日期','截止日期','优先级','状态','进度','目标','行动安排','制定依据'],...window.filtered.map(p=>[p.title,p.department,p.owner,p.start,p.due,p.priority,p.status,p.progress,plainText(p.goal),plainText(p.tasks),p.basisIds.map(id=>db.bases.find(b=>b.id===id)?.title).join('；')])]:[['依据名称','分类','来源','日期','正文'],...window.filtered.map(b=>[b.title,b.category,b.source,b.date,b.content])];const csv=rows.map(r=>r.map(v=>'"'+String(v??'').replace(/^[=+@-]/,"'$&").replaceAll('"','""')+'"').join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=(is?'部门工作计划':'制定依据')+'-'+today()+'.csv';a.click();URL.revokeObjectURL(url);toast('已导出当前筛选结果');};
-load().catch(e=>{$('#list').innerHTML='<div class="empty">读取失败，请确认本地服务已启动后刷新。</div>';toast(e.message);});
+async function boot(){currentUser=await api('/api/auth/me');$('#current-user').textContent=currentUser.displayName+(currentUser.role==='admin'&&currentUser.displayName!=='管理员'?' · 管理员':'');$('#users-nav').hidden=currentUser.role!=='admin';await load();}
+boot().catch(error=>{$('#list').innerHTML='<div class="empty">读取失败，请确认本地服务已启动后刷新。</div>';toast(error.message);});
+window.addEventListener('pageshow',event=>{if(event.persisted)location.reload();});
+$('#logout').onclick=async()=>{try{await api('/api/auth/logout','POST');location.replace('/login');}catch(error){toast(error.message);}};
+
+function renderUsers(){
+ $('#breadcrumb').textContent='工作台 / 用户管理';$('#page-title').textContent='用户管理';$('#subtitle').textContent='由管理员分配账号、设置角色和管理登录权限。';$('#create').textContent='＋ 新建用户';
+ document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.view==='users'));
+ $('#list').innerHTML=`<table><thead><tr><th>账号 / 显示名称</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${users.map(u=>`<tr><td>${esc(u.username)}<span class="sub">${esc(u.displayName)}${u.id===currentUser.id?' · 当前用户':''}</span></td><td>${u.role==='admin'?'管理员':'普通用户'}</td><td><span class="badge ${u.enabled?'green':'gray'}">${u.enabled?'启用':'已停用'}</span></td><td>${esc(new Date(u.createdAt).toLocaleString('zh-CN'))}</td><td class="actions"><button data-user-edit="${esc(u.id)}">编辑 / 重置密码</button>${u.id!==currentUser.id?`<button data-user-delete="${esc(u.id)}">删除</button>`:''}</td></tr>`).join('')}</tbody></table>`;
+}
+function editUser(id){
+ const u=users.find(u=>u.id===id);editingUser=u?.id||null;
+ const form=$('#user-form');form.reset();form.elements.username.value=u?.username||'';form.elements.username.readOnly=!!u;form.elements.displayName.value=u?.displayName||'';form.elements.role.value=u?.role||'user';form.elements.enabled.value=String(u?.enabled??true);form.elements.password.required=!u;
+ $('#password-help').textContent=u?'留空保留原密码；修改密码后该用户须重新登录。':'设置 4 至 128 个字符的初始密码。';$('#user-dialog-title').textContent=u?'编辑用户':'新建用户';$('#user-form-error').textContent='';$('#user-editor').showModal();
+}
+$('#user-editor').addEventListener('close',()=>$('#user-form').reset());
+$('#user-form').onsubmit=async event=>{
+ event.preventDefault();const button=event.submitter;button.disabled=true;$('#user-form-error').textContent='';
+ try{
+  const data=Object.fromEntries(new FormData(event.target));data.enabled=data.enabled==='true';
+  await api('/api/users'+(editingUser?'/'+editingUser:''),editingUser?'PUT':'POST',data);$('#user-editor').close();await boot();toast('用户已保存');
+ }catch(error){$('#user-form-error').textContent=error.message;}finally{button.disabled=false;}
+};
+document.addEventListener('click',async event=>{
+ const b=event.target.closest('button');if(!b)return;
+ if(b.dataset.userEdit)editUser(b.dataset.userEdit);
+ if(b.dataset.userDelete&&confirm('确定删除该用户？其登录会话会立即失效，已有计划和依据会保留。')){
+  try{await api('/api/users/'+b.dataset.userDelete,'DELETE');await load();toast('用户已删除');}catch(error){toast(error.message);}
+ }
+});

@@ -1,21 +1,25 @@
 import {test} from 'node:test';
+import {DatabaseSync} from 'node:sqlite';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {mkdtemp,rm,writeFile,readFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 test('依据与计划的完整生命周期、删除保护、重启保存及非法输入',async()=>{
- const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-'));let proc;
+ const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-'));let proc,cookie='';
  const start=()=>new Promise((resolve,reject)=>{proc=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'3219',DATA_DIR:dir}});proc.stdout.once('data',resolve);proc.once('error',reject);proc.once('exit',code=>{if(code)reject(Error('服务启动失败'));});});
  const stop=()=>new Promise(resolve=>{proc.once('exit',resolve);proc.kill();});
- const api=async(p,method='GET',data)=>{const r=await fetch('http://127.0.0.1:3219'+p,{method,headers:{'Content-Type':'application/json'},...(data?{body:JSON.stringify(data)}:{})});return {status:r.status,body:await r.json()};};
+ const api=async(p,method='GET',data)=>{const r=await fetch('http://127.0.0.1:3219'+p,{method,headers:{'Content-Type':'application/json',Cookie:cookie},...(data?{body:JSON.stringify(data)}:{})});if(r.headers.get('set-cookie'))cookie=r.headers.get('set-cookie').split(';')[0];return {status:r.status,body:await r.json()};};
  try{
  const legacy={id:'legacy',title:'历史计划',goal:'第一行 & 内容\n第二行',tasks:'旧行动\n旧进展',basisIds:[]};
  await writeFile(path.join(dir,'workbench.json'),JSON.stringify({plans:[legacy],bases:[]}));
  await start();
+ await api('/api/auth/login','POST',{username:'admin',password:'admin'});
  const legacyData=(await api('/api/data')).body.plans[0];
  assert.equal(legacyData.goal,'<p>第一行 &amp; 内容<br>第二行</p>');
- assert.equal(JSON.parse(await readFile(path.join(dir,'workbench.json'),'utf8')).plans[0].goal,legacy.goal);
+ await assert.rejects(readFile(path.join(dir,'workbench.json')),error=>error.code==='ENOENT');
+ assert.equal(JSON.parse(await readFile(path.join(dir,'workbench.json.migrated.bak'),'utf8')).plans[0].goal,legacy.goal);
+ const storedPlans=()=>{const sql=new DatabaseSync(path.join(dir,'workbench.sqlite'),{readOnly:true});try{return sql.prepare('SELECT * FROM plans').all();}finally{sql.close();}};
  await api('/api/plans/legacy','DELETE');const b=await api('/api/bases','POST',{title:'季度目标',category:'战略目标',content:'提升交付质量',date:'2026-11-12',source:'季度会议'});assert.equal(b.status,201);
  const input={title:'建立交付复盘机制',department:'运营部',owner:'负责人',start:'2026-11-12',due:'2026-12-12',priority:'高',status:'进行中',progress:20,goal:'每周复盘',tasks:'整理问题',basisIds:[b.body.id]};
  const p=await api('/api/plans','POST',input);assert.equal(p.status,201);assert.equal((await api('/api/bases/'+b.body.id,'DELETE')).status,409);
@@ -24,27 +28,27 @@ test('依据与计划的完整生命周期、删除保护、重启保存及非�
  for(const goal of ['<p><br></p>','<p>&nbsp;\u200b</p>','<script>alert(1)</script>'])assert.equal((await api('/api/plans','POST',{...input,goal})).status,400);
  const rich=await api('/api/plans/'+p.body.id,'PUT',{...input,goal:'<h2 onclick="alert(1)">验收</h2><p><b>每周复盘</b><img src=x onerror=alert(1)></p>',tasks:'<a href="javascript:alert(1)">行动</a><script>alert(1)</script>'});
  assert.equal(rich.body.goal,'<h2>验收</h2><p><strong>每周复盘</strong></p>');assert.equal(rich.body.tasks,'<a>行动</a>');
- assert.equal(JSON.parse(await readFile(path.join(dir,'workbench.json'),'utf8')).plans[0].goal,rich.body.goal);
+ assert.equal(storedPlans()[0].goal,rich.body.goal);
  assert.equal((await api('/api/data')).body.plans[0].tasks,rich.body.tasks);
  const done=await api('/api/plans/'+p.body.id,'PUT',{...input,goal:rich.body.goal,tasks:rich.body.tasks,status:'已完成'});assert.equal(done.body.progress,100);
  await stop();await start();const saved=await api('/api/data');assert.equal(saved.body.plans[0].title,input.title);assert.equal(saved.body.plans[0].progress,100);assert.equal(saved.body.plans[0].goal,rich.body.goal);assert.equal(saved.body.plans[0].tasks,rich.body.tasks);
  assert.equal((await api('/api/plans/'+p.body.id,'DELETE')).status,200);assert.equal((await api('/api/bases/'+b.body.id,'DELETE')).status,200);assert.equal((await api('/api/data')).body.plans.length,0);
  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aB1cAAAAASUVORK5CYII=','base64');
- const upload=async(body,type='image/png',headers={})=>fetch('http://127.0.0.1:3219/api/uploads',{method:'POST',headers:{'Content-Type':type,...headers},body});
+ const upload=async(body,type='image/png',headers={})=>fetch('http://127.0.0.1:3219/api/uploads',{method:'POST',headers:{'Content-Type':type,Cookie:cookie,...headers},body});
  const uploaded=await upload(png,'image/png',{'X-Filename':'../../workbench.json'});assert.equal(uploaded.status,201);
  const {location}=await uploaded.json();assert.match(location,/^\/uploads\/[a-f0-9-]{36}\.png$/);
- const downloaded=await fetch('http://127.0.0.1:3219'+location);assert.equal(downloaded.headers.get('content-type'),'image/png');assert.equal(downloaded.headers.get('x-content-type-options'),'nosniff');assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()),png);
+ const downloaded=await fetch('http://127.0.0.1:3219'+location,{headers:{Cookie:cookie}});assert.equal(downloaded.headers.get('content-type'),'image/png');assert.equal(downloaded.headers.get('x-content-type-options'),'nosniff');assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()),png);
  assert.deepEqual(await readFile(path.join(dir,location.slice(1))),png);
  const withImage=await api('/api/plans','POST',{...input,basisIds:[],goal:`<p>图文验收</p><img src="${location}" width="300">`,tasks:`<img src="${location}">`});assert.equal(withImage.status,201);assert.ok(withImage.body.goal.includes(location));
- assert.doesNotMatch(await readFile(path.join(dir,'workbench.json'),'utf8'),/base64|data:image/);
- await stop();await start();assert.equal((await fetch('http://127.0.0.1:3219'+location)).status,200);assert.ok((await api('/api/data')).body.plans[0].goal.includes(location));
+ assert.doesNotMatch(storedPlans()[0].goal,/base64|data:image/);
+ await stop();await start();assert.equal((await fetch('http://127.0.0.1:3219'+location,{headers:{Cookie:cookie}})).status,200);assert.ok((await api('/api/data')).body.plans[0].goal.includes(location));
  for(const [body,type] of [[png,'image/svg+xml'],[png,'text/html'],[Buffer.from('<script>bad</script>'),'image/png'],[png,'image/jpeg'],[Buffer.alloc(0),'image/png']])assert.equal((await upload(body,type)).status,415);
  assert.equal((await upload(Buffer.alloc(10*1024*1024+1))).status,413);
  assert.equal((await upload(png,'image/png',{Origin:'http://untrusted.invalid'})).status,403);
- assert.equal((await fetch('http://127.0.0.1:3219/uploads/%2e%2e%2fworkbench.json')).status,404);
+ assert.equal((await fetch('http://127.0.0.1:3219/uploads/%2e%2e%2fworkbench.json',{headers:{Cookie:cookie}})).status,404);
  for(const asset of ['/vendor/tinymce/tinymce.min.js','/vendor/tinymce/langs/zh-CN.js','/vendor/tinymce/plugins/table/plugin.min.js','/vendor/tinymce/skins/ui/oxide/skin.min.css','/editor-content.css'])assert.equal((await fetch('http://127.0.0.1:3219'+asset)).status,200);
  
  for(const asset of ['/rich-text.js','/rich-editor.js'])assert.equal((await fetch('http://127.0.0.1:3219'+asset)).status,200);
- const page=await fetch('http://127.0.0.1:3219');assert.match(await page.text(),/部门工作计划/);
+ const page=await fetch('http://127.0.0.1:3219',{headers:{Cookie:cookie}});assert.match(await page.text(),/部门工作计划/);
  }finally{if(proc?.exitCode===null)await stop();await rm(dir,{recursive:true,force:true});}
 });
