@@ -2,6 +2,12 @@
 
 > 新记录写在最上面。每次修改前先读本文件，修改后追加一条。规则见 `AGENTS.md`。
 
+## 2026-11-14 21:45（来源：Codex 应用）
+- 改动内容：为云服务器 Nginx HTTPS 部署增加 `APP_ORIGIN` 明确入口配置，校验 HTTPS 来源并给登录 / 退出 Cookie 添加 Secure；不依赖客户端转发头放宽策略，未配置时保留本机 HTTP 行为；错误配置在初始化数据库前停止启动。补充云端单实例、独立数据目录、代理上传大小、证书和 systemd 更新说明。
+- 涉及文件：`server.js`、`test/auth.test.js`、`test/workbench.test.js`、`README.md`、`CHANGELOG.md`
+- 测试情况：npm test 全部通过（11 项，0 失败），新增覆盖 HTTPS 入口登录、业务写入、图片上传读取、退出 Secure Cookie、伪造来源与转发头、错误配置不创建数据库；原有本机 HTTP、会话与 SQLite 流程通过；语法及 git diff --check 通过。
+- 未完成 / 待办：仅本地提交，等待用户自行推送；云服务器尚需更新源码、配置 APP_ORIGIN、Nginx 与证书及自动续期，并在公网开放应用前修改默认管理员密码。未修改现有本地数据库或重启本地服务。
+
 ## 2026-11-14 18:42（来源：Codex 应用）
 - 改动内容：新增登录与管理员用户管理（分配账号、角色、启停、重置密码、删除），不提供注册；使用随机盐 scrypt 密码哈希和 SQLite 会话，HttpOnly / SameSite Cookie 保持 30 天，退出、过期或账号变更撤销会话，限制连续失败登录；全部业务数据改为 SQLite 关系表和事务，图片保留本地路径；首次事务迁移旧 JSON 并改名保留原始备份，失败回滚且后续不重复导入；提升运行要求到 Node.js 22.13+，无新增 npm 依赖。按用户最新要求将协作规则同步为仅明确指令时代为推送。
 - 涉及文件：`server.js`、`src/database.js`、`public/login.html`、`public/login.js`、`public/index.html`、`public/app.js`、`public/style.css`、`package.json`、`package-lock.json`、`test/auth.test.js`、`test/workbench.test.js`、`.gitignore`、`README.md`、`AGENTS.md`、`CHANGELOG.md`

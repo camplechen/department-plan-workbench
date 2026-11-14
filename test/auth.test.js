@@ -1,16 +1,16 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 import {mkdtemp,rm,writeFile,readFile} from 'node:fs/promises';
 import {DatabaseSync} from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
 import {openStore} from '../src/database.js';
 
-async function service(){
+async function service(environment={}){
  const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-auth-'));let proc,base;
  const start=()=>new Promise((resolve,reject)=>{
-  proc=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',DATA_DIR:dir}});let output='';
+  proc=spawn(process.execPath,['server.js'],{env:{...process.env,APP_ORIGIN:'',...environment,PORT:'0',DATA_DIR:dir}});let output='';
   const timer=setTimeout(()=>{proc.kill();reject(Error('测试服务启动超时'));},10000);
   proc.stdout.on('data',chunk=>{output+=chunk;const match=output.match(/http:\/\/127\.0\.0\.1:\d+/);if(match){base=match[0];clearTimeout(timer);resolve();}});
   proc.once('error',error=>{clearTimeout(timer);reject(error);});proc.once('exit',()=>{clearTimeout(timer);reject(Error('测试服务已退出'));});
@@ -22,7 +22,7 @@ async function service(){
   const text=await response.text();let body;try{body=JSON.parse(text);}catch{body=text;}
   return {status:response.status,body,headers:response.headers};
  }});
- await start();return {dir,start,stop,client,async close(){await stop();await rm(dir,{recursive:true,force:true});}};
+ await start();return {dir,start,stop,client,url:()=>base,async close(){await stop();await rm(dir,{recursive:true,force:true});}};
 }
 
 test('登录保护、Cookie 保持、SQLite 会话、退出及过期失效',async()=>{
@@ -94,5 +94,45 @@ test('旧数据事务迁移保留顺序与关联，重启不重复导入，失�
   const invalid={bases:[{id:'same'},{id:'same'}],plans:[]};const text=JSON.stringify(invalid);await writeFile(path.join(badDir,'workbench.json'),text);
   await assert.rejects(openStore(badDir));assert.equal(await readFile(path.join(badDir,'workbench.json'),'utf8'),text);
   const sql=new DatabaseSync(path.join(badDir,'workbench.sqlite'));assert.equal(sql.prepare('SELECT count(*) AS n FROM bases').get().n,0);assert.equal(sql.prepare('SELECT count(*) AS n FROM users').get().n,0);sql.close();
+ }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('HTTPS 代理入口接受可信来源，登录与退出 Cookie 带 Secure，拒绝伪造转发来源',async()=>{
+ const origin='https://workbench.example.test';
+ const s=await service({APP_ORIGIN:origin});try{
+  const c=s.client(),credentials={username:'admin',password:'admin'};
+  const login=await c.request('/api/auth/login','POST',credentials,{Origin:origin,Host:'127.0.0.1'});
+  assert.equal(login.status,200);assert.match(login.headers.get('set-cookie'),/; Secure/);
+  assert.equal((await c.request('/api/auth/me','GET',undefined,{Origin:origin})).status,200);
+  const created=await c.request('/api/bases','POST',{title:'HTTPS 计划依据',category:'其他',content:'验收正文'},{Origin:origin});assert.equal(created.status,201);
+  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aB1cAAAAASUVORK5CYII=','base64');
+  const uploaded=await fetch(s.url()+'/api/uploads',{method:'POST',headers:{Cookie:c.cookie,Origin:origin,'Content-Type':'image/png'},body:png});
+  assert.equal(uploaded.status,201);const {location}=await uploaded.json();assert.equal((await c.request(location,'GET',undefined,{Origin:origin})).status,200);
+  for(const other of ['http://workbench.example.test','https://other.example.test','null']){
+   assert.equal((await c.request('/api/auth/login','POST',credentials,{Origin:other,'X-Forwarded-Proto':'https','X-Forwarded-Host':'other.example.test'})).status,403);
+  }
+  assert.equal((await c.request('/api/auth/logout','POST',undefined,{Origin:origin,'Sec-Fetch-Site':'cross-site'})).status,403);
+  const logout=await c.request('/api/auth/logout','POST',undefined,{Origin:origin});assert.equal(logout.status,200);assert.match(logout.headers.get('set-cookie'),/Max-Age=0/);assert.match(logout.headers.get('set-cookie'),/; Secure/);
+  assert.equal((await c.request('/api/data')).status,401);
+ }finally{await s.close();}
+ const local=await service();try{
+  const c=local.client();const login=await c.request('/api/auth/login','POST',{username:'admin',password:'admin'},{'X-Forwarded-Proto':'https'});
+  assert.equal(login.status,200);assert.doesNotMatch(login.headers.get('set-cookie'),/; Secure/);
+ }finally{await local.close();}
+});
+
+
+test('错误的公网来源配置在初始化数据库前停止启动',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-origin-'));
+ try{
+  const withUser=new URL('https://example.test');withUser.username='fixture';
+  const invalid=['file:///tmp/workbench','https://example.test/path','https://example.test/?query=value','https://example.test/#fragment',withUser.href,'not-an-origin'];
+  for(let index=0;index<invalid.length;index++){
+   const dataDir=path.join(dir,String(index));
+   const result=spawnSync(process.execPath,['server.js'],{env:{...process.env,APP_ORIGIN:invalid[index],PORT:'0',DATA_DIR:dataDir},encoding:'utf8',timeout:5000});
+   assert.equal(result.status,1);assert.match(result.stderr,/APP_ORIGIN 必须/);
+   await assert.rejects(readFile(path.join(dataDir,'workbench.sqlite')),error=>error.code==='ENOENT');
+  }
  }finally{await rm(dir,{recursive:true,force:true});}
 });

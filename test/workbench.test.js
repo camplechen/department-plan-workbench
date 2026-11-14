@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 test('依据与计划的完整生命周期、删除保护、重启保存及非法输入',async()=>{
  const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-'));let proc,cookie='';
- const start=()=>new Promise((resolve,reject)=>{proc=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'3219',DATA_DIR:dir}});proc.stdout.once('data',resolve);proc.once('error',reject);proc.once('exit',code=>{if(code)reject(Error('服务启动失败'));});});
+ const start=()=>new Promise((resolve,reject)=>{proc=spawn(process.execPath,['server.js'],{env:{...process.env,APP_ORIGIN:'',PORT:'3219',DATA_DIR:dir}});proc.stdout.once('data',resolve);proc.once('error',reject);proc.once('exit',code=>{if(code)reject(Error('服务启动失败'));});});
  const stop=()=>new Promise(resolve=>{proc.once('exit',resolve);proc.kill();});
  const api=async(p,method='GET',data)=>{const r=await fetch('http://127.0.0.1:3219'+p,{method,headers:{'Content-Type':'application/json',Cookie:cookie},...(data?{body:JSON.stringify(data)}:{})});if(r.headers.get('set-cookie'))cookie=r.headers.get('set-cookie').split(';')[0];return {status:r.status,body:await r.json()};};
  try{

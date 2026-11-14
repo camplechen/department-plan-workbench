@@ -8,6 +8,15 @@ import {fileURLToPath} from 'node:url';
 const root=path.dirname(fileURLToPath(import.meta.url));
 const dir=process.env.DATA_DIR||path.join(root,'data');
 const uploadDir=path.join(dir,'uploads');
+// 公网入口由服务器配置指定，不信任客户端可伪造的转发头。
+let appOrigin=null;
+if(process.env.APP_ORIGIN){
+ try{
+  const entry=new URL(process.env.APP_ORIGIN);
+  if(!['http:','https:'].includes(entry.protocol)||entry.username||entry.password||entry.pathname!=='/'||entry.search||entry.hash)throw Error();
+  appOrigin=entry.origin;
+ }catch{throw Error('APP_ORIGIN 必须是完整的 HTTP/HTTPS 来源地址，不能含账号、密码、路径、查询参数或片段');}
+}
 const store=await openStore(dir);
 function validate(type,b,db){
  if(!b || typeof b!=='object' || Array.isArray(b))throw fail('提交内容格式不正确');
@@ -37,14 +46,14 @@ const server=http.createServer(async(req,res)=>{
  const user=store.session(sessionToken);
  const requireUser=()=>{if(!store.session(sessionToken))throw fail('请先登录',401);};
  const requireAdmin=()=>{requireUser();if(store.session(sessionToken)?.role!=='admin')throw fail('仅管理员可管理用户',403);};
- const cookie=(token,age=sessionSeconds)=>`workbench_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}`;
+ const cookie=(token,age=sessionSeconds)=>`workbench_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${age}${appOrigin?.startsWith('https://')?'; Secure':''}`;
  const inputJSON=async()=>{
    let body='';for await(const chunk of req){body+=chunk;if(Buffer.byteLength(body)>1200000)throw fail('提交内容过大',413);}
    try {const input=JSON.parse(body||'{}');if(!input||typeof input!=='object'||Array.isArray(input))throw Error();return input;}
    catch {throw fail('提交内容格式不正确');}
  };
  const checkOrigin=()=>{
-   if(req.headers['sec-fetch-site']==='cross-site'||(req.headers.origin&&req.headers.origin!==`http://${req.headers.host}`))throw fail('不允许跨来源操作',403);
+   if(req.headers['sec-fetch-site']==='cross-site'||(req.headers.origin&&req.headers.origin!==(appOrigin||`http://${req.headers.host}`)))throw fail('不允许跨来源操作',403);
  };
  if(url.pathname==='/'&&!user){res.writeHead(302,{Location:'/login'});return res.end();}
  if(url.pathname==='/login'&&user){res.writeHead(302,{Location:'/'});return res.end();}
