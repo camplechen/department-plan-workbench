@@ -1,7 +1,7 @@
 import http from 'node:http';
 import {sanitizeHTML,hasText} from './public/rich-text.js';
 import {readFile,writeFile,mkdir} from 'node:fs/promises';
-import {openStore,fail,publicUser,hashPassword,verifyPassword,sessionSeconds} from './src/database.js';
+import {openStore,fail,hashPassword,verifyPassword,sessionSeconds} from './src/database.js';
 import {randomUUID} from 'node:crypto';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -78,17 +78,49 @@ const server=http.createServer(async(req,res)=>{
    store.sql.prepare('DELETE FROM login_attempts WHERE username=?').run(loginName);
    store.revoke(sessionToken);
    res.setHeader('Set-Cookie',cookie(store.createSession(account.id)));
-   return send(200,publicUser(current));
+   return send(200,store.userView(current));
  }
  if(url.pathname==='/api/auth/logout'&&req.method==='POST') {
    store.revoke(sessionToken);res.setHeader('Set-Cookie',cookie('',0));return send(200,{message:'已退出登录'});
  }
  requireUser();
- if(url.pathname==='/api/auth/me'&&req.method==='GET')return send(200,publicUser(user));
+ if(url.pathname==='/api/auth/me'&&req.method==='GET')return send(200,store.userView(user));
+ const organizationRoute=url.pathname.match(/^\/api\/organizations(?:\/([\w-]+))?$/);
+ if(organizationRoute){
+   requireAdmin();const id=organizationRoute[1];
+   if(req.method==='GET'&&!id)return send(200,store.sql.prepare('SELECT * FROM organizations ORDER BY name,id').all());
+   if(!['POST','PUT','DELETE'].includes(req.method)||(req.method==='POST'&&id)||(req.method!=='POST'&&!id))throw fail('请求方式不支持',405);
+   const input=req.method==='DELETE'?null:await inputJSON();
+   const result=store.transaction(()=>{
+     requireAdmin();
+     const target=id?store.sql.prepare('SELECT * FROM organizations WHERE id=?').get(id):null;
+     if(id&&!target)throw fail('组织机构不存在',404);
+     if(req.method==='DELETE'){
+       if(store.sql.prepare('SELECT 1 FROM organizations WHERE parentId=?').get(id))throw fail('该机构下仍有下级机构，请先调整或删除下级机构',409);
+       if(store.sql.prepare('SELECT 1 FROM user_organizations WHERE organizationId=?').get(id))throw fail('该机构下仍有用户，请先调整用户归属',409);
+       store.sql.prepare('DELETE FROM organizations WHERE id=?').run(id);return {message:'组织机构已删除'};
+     }
+     const name=typeof input.name==='string'?input.name.trim():'';
+     if(!name||name.length>100)throw fail('机构名称须为 1 至 100 个字符');
+     const parentId=input.parentId??null;
+     if(parentId!==null&&(typeof parentId!=='string'||!store.sql.prepare('SELECT 1 FROM organizations WHERE id=?').get(parentId)))throw fail('上级机构不存在');
+     let ancestor=parentId;
+     while(ancestor){
+       if(ancestor===id)throw fail('不能将自身或下级机构设为上级');
+       ancestor=store.sql.prepare('SELECT parentId FROM organizations WHERE id=?').get(ancestor).parentId;
+     }
+     if(store.sql.prepare('SELECT 1 FROM organizations WHERE name=? AND parentId IS ? AND id<>?').get(name,parentId,id||''))throw fail('同一上级下已存在同名机构',409);
+     const record={id:id||randomUUID(),name,parentId,createdAt:target?.createdAt||new Date().toISOString()};
+     if(target)store.sql.prepare('UPDATE organizations SET name=?,parentId=? WHERE id=?').run(name,parentId,id);
+     else store.sql.prepare('INSERT INTO organizations VALUES (?,?,?,?)').run(record.id,name,parentId,record.createdAt);
+     return record;
+   });
+   return send(req.method==='POST'?201:200,result);
+ }
  const userRoute=url.pathname.match(/^\/api\/users(?:\/([\w-]+))?$/);
  if(userRoute){
    requireAdmin();const id=userRoute[1];
-   if(req.method==='GET'&&!id)return send(200,store.sql.prepare('SELECT * FROM users ORDER BY createdAt,id').all().map(publicUser));
+   if(req.method==='GET'&&!id)return send(200,store.sql.prepare('SELECT * FROM users ORDER BY createdAt,id').all().map(store.userView));
    if(!['POST','PUT','DELETE'].includes(req.method)||(req.method==='POST'&&id)||(req.method!=='POST'&&!id))throw fail('请求方式不支持',405);
    const target=id?store.sql.prepare('SELECT * FROM users WHERE id=?').get(id):null;
    if(id&&!target)throw fail('用户不存在',404);
@@ -105,12 +137,15 @@ const server=http.createServer(async(req,res)=>{
    if(input.displayName!==undefined&&typeof input.displayName!=='string')throw fail('显示名称格式不正确');
    const displayName=input.displayName?.trim()||username, role=input.role??target?.role??'user', enabled=input.enabled??(target?!!target.enabled:true);
    if(typeof displayName!=='string'||displayName.length>100||!['admin','user'].includes(role)||typeof enabled!=='boolean')throw fail('用户信息格式不正确');
+   if(!Array.isArray(input.organizationIds)||!input.organizationIds.length||input.organizationIds.some(id=>typeof id!=='string'||!id))throw fail('请至少选择一个归属组织机构');
+   const organizationIds=[...new Set(input.organizationIds)];
    const changePassword=input.password!==undefined&&input.password!=='';
    if((!target||changePassword)&&(typeof input.password!=='string'||input.password.length<4||input.password.length>128))throw fail('密码长度须为 4 至 128 个字符');
    const passwordHash=(!target||changePassword)?await hashPassword(input.password):target.passwordHash;
    const record={id:target?.id||randomUUID(),username,displayName,role,enabled:enabled?1:0,passwordHash,createdAt:target?.createdAt||new Date().toISOString()};
    store.transaction(()=>{
      const caller=store.session(sessionToken);if(!caller||caller.role!=='admin')throw fail('管理员登录已失效',401);
+     for(const organizationId of organizationIds)if(!store.sql.prepare('SELECT 1 FROM organizations WHERE id=?').get(organizationId))throw fail('归属组织机构不存在，请重新选择');
      if(target){
        if(id===user.id&&(!enabled||role!=='admin'))throw fail('不能停用当前管理员或取消自身管理员权限');
        const fresh=store.sql.prepare('SELECT * FROM users WHERE id=?').get(id);if(!fresh)throw fail('用户不存在',404);
@@ -121,8 +156,10 @@ const server=http.createServer(async(req,res)=>{
        if(store.sql.prepare('SELECT 1 FROM users WHERE username=?').get(username))throw fail('该账号已存在',409);
        store.sql.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?)').run(record.id,username,displayName,passwordHash,role,record.enabled,record.createdAt);
      }
+     store.sql.prepare('DELETE FROM user_organizations WHERE userId=?').run(record.id);
+     for(const organizationId of organizationIds)store.sql.prepare('INSERT INTO user_organizations VALUES (?,?)').run(record.id,organizationId);
    });
-   return send(target?200:201,publicUser(record));
+   return send(target?200:201,store.userView(record));
  }
 
  const db=store.readData();

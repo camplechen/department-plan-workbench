@@ -1,16 +1,16 @@
 import {sanitizeHTML,plainText,hasText,hasContent} from './rich-text.js';
 import {richField,setupEditors,destroyEditors,readEditors} from './rich-editor.js';
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let db={plans:[],bases:[]},view='plans',grouped=false,editing=null,currentUser=null,users=[],editingUser=null;
+let db={plans:[],bases:[]},view='plans',grouped=false,editing=null,currentUser=null,users=[],editingUser=null,organizations=[],editingOrganization=null,userTab='users';
 const today=()=>new Date().toLocaleDateString('en-CA');
 const overdue=p=>p.due<today()&&!['已完成','已暂停'].includes(p.status);
 const badge=p=>`<span class="badge ${overdue(p)?'red':p.status==='已完成'?'green':p.status==='草稿'||p.status==='已暂停'?'gray':''}">${overdue(p)?'已逾期':esc(p.status)}</span>`;
 function toast(t){$('#toast').textContent=t;$('#toast').style.display='block';setTimeout(()=>$('#toast').style.display='none',3000);}
 async function api(url,method='GET',data){const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},...(data?{body:JSON.stringify(data)}:{})});const v=await r.json();if(r.status===401){location.replace('/login');throw Error('登录已失效，请重新登录');}if(!r.ok)throw Error(v.error);return v;}
-async function load(){db=await api('/api/data');if(currentUser?.role==='admin')users=await api('/api/users');render();}
+async function load(){db=await api('/api/data');if(currentUser?.role==='admin'){users=await api('/api/users');organizations=await api('/api/organizations');}render();}
 const opts=(items,current)=>items.map(x=>`<option ${x===current?'selected':''}>${esc(x)}</option>`).join('');
 function render(){
- $('#stats').hidden=view==='users';$('.tabs').hidden=view==='users';$('.filters').hidden=view==='users';$('#export').hidden=view==='users';
+ $('#stats').hidden=view==='users';$('#business-tabs').hidden=view==='users';$('#user-tabs').hidden=view!=='users';$('.filters').hidden=view==='users';$('#export').hidden=view==='users';
  if(view==='users'){renderUsers();return;}
  const isPlan=view==='plans';$('#breadcrumb').textContent='工作台 / '+(isPlan?'部门工作计划':'制定依据库');$('#page-title').textContent=isPlan?'部门工作计划':'制定依据库';$('#subtitle').textContent=isPlan?'把部门目标转化为行动，让制定依据与计划紧密相连。':'沉淀目标、数据与要求，为每一项计划提供清晰的依据。';$('#create').textContent=isPlan?'＋ 新建计划':'＋ 新建依据';
  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
@@ -47,7 +47,7 @@ $('#form').onsubmit=async e=>{
  await api('/api/'+editing.type+(editing.id?'/'+editing.id:''),editing.id?'PUT':'POST',data);await load();$('#editor').close();toast('已保存');
  }catch(error){$('#form-error').textContent=error.message;}finally{button.disabled=false;}
 };
-document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.hasAttribute('data-close'))b.closest('dialog').close();if(b.dataset.view){view=b.dataset.view;$('#search').value='';$('#status').value='';$('#category').value='';$('#department').value='';render();}if(b.id==='create'||b.hasAttribute('data-new')){if(view==='users')editUser();else edit(view);}if(b.dataset.edit)edit(b.dataset.type,b.dataset.edit);if(b.dataset.detail)detail(b.dataset.type,b.dataset.detail);if(b.dataset.related)detail('plans',b.dataset.related);if(b.dataset.plan)edit('plans',null,b.dataset.plan);if(b.dataset.delete&&confirm('确定删除这条记录吗？删除后无法恢复。')){try{await api('/api/'+b.dataset.type+'/'+b.dataset.delete,'DELETE');await load();toast('已删除');}catch(e){toast(e.message);}}});
+document.addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.hasAttribute('data-close'))b.closest('dialog').close();if(b.dataset.view){view=b.dataset.view;$('#search').value='';$('#status').value='';$('#category').value='';$('#department').value='';render();}if(b.id==='create'||b.hasAttribute('data-new')){if(view==='users'){if(userTab==='organizations')editOrganization();else editUser();}else edit(view);}if(b.dataset.edit)edit(b.dataset.type,b.dataset.edit);if(b.dataset.detail)detail(b.dataset.type,b.dataset.detail);if(b.dataset.related)detail('plans',b.dataset.related);if(b.dataset.plan)edit('plans',null,b.dataset.plan);if(b.dataset.delete&&confirm('确定删除这条记录吗？删除后无法恢复。')){try{await api('/api/'+b.dataset.type+'/'+b.dataset.delete,'DELETE');await load();toast('已删除');}catch(e){toast(e.message);}}});
 $('#all-tab').onclick=()=>{grouped=false;render();};$('#group-tab').onclick=()=>{grouped=true;render();};['search','status','department','category'].forEach(id=>$('#'+id).addEventListener(id==='search'?'input':'change',render));
 $('#export').onclick=()=>{const is=view==='plans';const rows=is?[['计划名称','部门','负责人','开始日期','截止日期','优先级','状态','进度','目标','行动安排','制定依据'],...window.filtered.map(p=>[p.title,p.department,p.owner,p.start,p.due,p.priority,p.status,p.progress,plainText(p.goal),plainText(p.tasks),p.basisIds.map(id=>db.bases.find(b=>b.id===id)?.title).join('；')])]:[['依据名称','分类','来源','日期','正文'],...window.filtered.map(b=>[b.title,b.category,b.source,b.date,b.content])];const csv=rows.map(r=>r.map(v=>'"'+String(v??'').replace(/^[=+@-]/,"'$&").replaceAll('"','""')+'"').join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=(is?'部门工作计划':'制定依据')+'-'+today()+'.csv';a.click();URL.revokeObjectURL(url);toast('已导出当前筛选结果');};
 async function boot(){currentUser=await api('/api/auth/me');$('#current-user').textContent=currentUser.displayName+(currentUser.role==='admin'&&currentUser.displayName!=='管理员'?' · 管理员':'');$('#users-nav').hidden=currentUser.role!=='admin';await load();}
@@ -58,18 +58,21 @@ $('#logout').onclick=async()=>{try{await api('/api/auth/logout','POST');location
 function renderUsers(){
  $('#breadcrumb').textContent='工作台 / 用户管理';$('#page-title').textContent='用户管理';$('#subtitle').textContent='由管理员分配账号、设置角色和管理登录权限。';$('#create').textContent='＋ 新建用户';
  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.view==='users'));
- $('#list').innerHTML=`<table><thead><tr><th>账号 / 显示名称</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${users.map(u=>`<tr><td>${esc(u.username)}<span class="sub">${esc(u.displayName)}${u.id===currentUser.id?' · 当前用户':''}</span></td><td>${u.role==='admin'?'管理员':'普通用户'}</td><td><span class="badge ${u.enabled?'green':'gray'}">${u.enabled?'启用':'已停用'}</span></td><td>${esc(new Date(u.createdAt).toLocaleString('zh-CN'))}</td><td class="actions"><button data-user-edit="${esc(u.id)}">编辑 / 重置密码</button>${u.id!==currentUser.id?`<button data-user-delete="${esc(u.id)}">删除</button>`:''}</td></tr>`).join('')}</tbody></table>`;
+ document.querySelectorAll('[data-user-tab]').forEach(b=>b.classList.toggle('selected',b.dataset.userTab===userTab));
+ if(userTab==='organizations'){renderOrganizations();return;}
+ $('#list').innerHTML=`<table><thead><tr><th>账号 / 显示名称</th><th>归属组织机构</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${users.map(u=>`<tr><td>${esc(u.username)}<span class="sub">${esc(u.displayName)}${u.id===currentUser.id?' · 当前用户':''}</span></td><td class="organization-path">${(u.organizationIds||[]).map(id=>esc(organizationPath(id))).join('<br>')}</td><td>${u.role==='admin'?'管理员':'普通用户'}</td><td><span class="badge ${u.enabled?'green':'gray'}">${u.enabled?'启用':'已停用'}</span></td><td>${esc(new Date(u.createdAt).toLocaleString('zh-CN'))}</td><td class="actions"><button data-user-edit="${esc(u.id)}">编辑 / 重置密码</button>${u.id!==currentUser.id?`<button data-user-delete="${esc(u.id)}">删除</button>`:''}</td></tr>`).join('')}</tbody></table>`;
 }
 function editUser(id){
+ if(!organizations.length){toast('请先在组织架构管理中新建机构');userTab='organizations';render();return;}
  const u=users.find(u=>u.id===id);editingUser=u?.id||null;
- const form=$('#user-form');form.reset();form.elements.username.value=u?.username||'';form.elements.username.readOnly=!!u;form.elements.displayName.value=u?.displayName||'';form.elements.role.value=u?.role||'user';form.elements.enabled.value=String(u?.enabled??true);form.elements.password.required=!u;
+ const form=$('#user-form');form.reset();form.elements.username.value=u?.username||'';form.elements.username.readOnly=!!u;form.elements.displayName.value=u?.displayName||'';form.elements.role.value=u?.role||'user';form.elements.enabled.value=String(u?.enabled??true);form.elements.password.required=!u;$('#user-organizations').innerHTML=organizationRows().map(({node})=>`<label><input type="checkbox" name="organizationIds" value="${esc(node.id)}" ${u?.organizationIds?.includes(node.id)?'checked':''}>${esc(organizationPath(node.id))}</label>`).join('');
  $('#password-help').textContent=u?'留空保留原密码；修改密码后该用户须重新登录。':'设置 4 至 128 个字符的初始密码。';$('#user-dialog-title').textContent=u?'编辑用户':'新建用户';$('#user-form-error').textContent='';$('#user-editor').showModal();
 }
 $('#user-editor').addEventListener('close',()=>$('#user-form').reset());
 $('#user-form').onsubmit=async event=>{
  event.preventDefault();const button=event.submitter;button.disabled=true;$('#user-form-error').textContent='';
  try{
-  const data=Object.fromEntries(new FormData(event.target));data.enabled=data.enabled==='true';
+  const formData=new FormData(event.target),data=Object.fromEntries(formData);data.enabled=data.enabled==='true';data.organizationIds=formData.getAll('organizationIds');if(!data.organizationIds.length)throw Error('请至少选择一个归属组织机构');
   await api('/api/users'+(editingUser?'/'+editingUser:''),editingUser?'PUT':'POST',data);$('#user-editor').close();await boot();toast('用户已保存');
  }catch(error){$('#user-form-error').textContent=error.message;}finally{button.disabled=false;}
 };
@@ -78,5 +81,51 @@ document.addEventListener('click',async event=>{
  if(b.dataset.userEdit)editUser(b.dataset.userEdit);
  if(b.dataset.userDelete&&confirm('确定删除该用户？其登录会话会立即失效，已有计划和依据会保留。')){
   try{await api('/api/users/'+b.dataset.userDelete,'DELETE');await load();toast('用户已删除');}catch(error){toast(error.message);}
+ }
+});
+
+// 用完整路径区分不同分支的同名机构，按树顺序展示可选机构。
+function organizationPath(id){
+ const names=[];let node=organizations.find(o=>o.id===id);
+ while(node){names.unshift(node.name);node=organizations.find(o=>o.id===node.parentId);}
+ return names.join(' / ');
+}
+function organizationRows(){
+ const rows=[],stack=organizations.filter(o=>!o.parentId).reverse().map(o=>({node:o,depth:0}));
+ while(stack.length){const row=stack.pop();rows.push(row);stack.push(...organizations.filter(o=>o.parentId===row.node.id).reverse().map(node=>({node,depth:row.depth+1})));}
+ return rows;
+}
+function organizationOptions(excluded=new Set()){
+ return organizationRows().filter(({node})=>!excluded.has(node.id)).map(({node})=>`<option value="${esc(node.id)}">${esc(organizationPath(node.id))}</option>`).join('');
+}
+function renderOrganizations(){
+ $('#subtitle').textContent='维护多层级组织机构，为用户分配明确的归属。';$('#create').textContent='＋ 新建机构';
+ $('#list').innerHTML=organizations.length?`<table class="organization-table"><thead><tr><th>组织架构</th><th>直属用户数</th><th>操作</th></tr></thead><tbody>${organizationRows().map(({node,depth})=>`<tr><td><div class="organization-name" style="padding-left:${Math.min(depth,12)*20}px">${depth?'└ ':''}${esc(node.name)}</div><span class="sub organization-path">${esc(organizationPath(node.id))}</span></td><td>${users.filter(u=>u.organizationIds?.includes(node.id)).length}</td><td class="actions"><button data-organization-child="${esc(node.id)}">新增下级</button><button data-organization-edit="${esc(node.id)}">编辑</button><button data-organization-delete="${esc(node.id)}">删除</button></td></tr>`).join('')}</tbody></table>`:'<div class="empty"><h3>尚未创建组织机构</h3><p>点击「新建机构」建立组织架构，再为用户选择归属。</p></div>';
+}
+function editOrganization(id,parentId=null){
+ const node=organizations.find(o=>o.id===id);editingOrganization=node?.id||null;
+ const excluded=new Set(node?[node.id]:[]);
+ for(const {node:o} of organizationRows())if(excluded.has(o.parentId))excluded.add(o.id);
+ const form=$('#organization-form');form.reset();form.elements.name.value=node?.name||'';
+ form.elements.parentId.innerHTML='<option value="">无上级（顶级机构）</option>'+organizationOptions(excluded);
+ form.elements.parentId.value=node?.parentId||parentId||'';
+ $('#organization-dialog-title').textContent=node?'编辑组织机构':parentId?'新增下级机构':'新建组织机构';
+ $('#organization-form-error').textContent='';$('#organization-editor').showModal();
+}
+$('#organization-form').onsubmit=async event=>{
+ event.preventDefault();const button=event.submitter;button.disabled=true;$('#organization-form-error').textContent='';
+ try{
+  const data=Object.fromEntries(new FormData(event.target));data.parentId=data.parentId||null;
+  await api('/api/organizations'+(editingOrganization?'/'+editingOrganization:''),editingOrganization?'PUT':'POST',data);
+  $('#organization-editor').close();await load();toast('组织机构已保存');
+ }catch(error){$('#organization-form-error').textContent=error.message;}finally{button.disabled=false;}
+};
+document.addEventListener('click',async event=>{
+ const b=event.target.closest('button');if(!b)return;
+ if(b.dataset.userTab){userTab=b.dataset.userTab;render();}
+ if(b.dataset.organizationEdit)editOrganization(b.dataset.organizationEdit);
+ if(b.dataset.organizationChild)editOrganization(null,b.dataset.organizationChild);
+ if(b.dataset.organizationDelete&&confirm('确定删除该机构？存在下级机构或归属用户时无法删除。')){
+  try{await api('/api/organizations/'+b.dataset.organizationDelete,'DELETE');await load();toast('组织机构已删除');}catch(error){toast(error.message);}
  }
 });

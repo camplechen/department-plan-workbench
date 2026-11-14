@@ -56,7 +56,7 @@ test('登录保护、Cookie 保持、SQLite 会话、退出及过期失效',asyn
 test('管理员分配账号、用户管理权限、共享数据、重置密码及停用删除撤销会话',async()=>{
  const s=await service();try{
   const admin=s.client(),member=s.client();await admin.request('/api/auth/login','POST',{username:'admin',password:'admin'});
-  const input={username:'test.member',password:'fixture-password',displayName:'测试成员',role:'user',enabled:true};
+  const input={organizationIds:['default-organization'],username:'test.member',password:'fixture-password',displayName:'测试成员',role:'user',enabled:true};
   const created=await admin.request('/api/users','POST',input);assert.equal(created.status,201);const id=created.body.id;
   assert.equal((await admin.request('/api/users','POST',input)).status,409);
   assert.equal((await admin.request('/api/users','POST',{...input,username:input.username.toUpperCase()})).status,409);
@@ -134,5 +134,66 @@ test('错误的公网来源配置在初始化数据库前停止启动',async()=>
    assert.equal(result.status,1);assert.match(result.stderr,/APP_ORIGIN 必须/);
    await assert.rejects(readFile(path.join(dataDir,'workbench.sqlite')),error=>error.code==='ENOENT');
   }
+ }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('多层组织维护、循环与删除保护、跨层多机构归属必填及权限',async()=>{
+ const s=await service();try{
+  const admin=s.client(),member=s.client(),guest=s.client();
+  assert.equal((await guest.request('/api/organizations')).status,401);
+  await admin.request('/api/auth/login','POST',{username:'admin',password:'admin'});
+  const create=async(name,parentId=null)=>{const response=await admin.request('/api/organizations','POST',{name,parentId});assert.equal(response.status,201);return response.body;};
+  const root=await create('总部'),child=await create('运营部',root.id),leaf=await create('一组',child.id),other=await create('另一总部');
+  for(const data of [{name:''},{name:'x'.repeat(101)},{name:[]},{name:'不存在上级',parentId:'missing'},{name:'错误上级',parentId:7}])assert.equal((await admin.request('/api/organizations','POST',data)).status,400);
+  assert.equal((await admin.request('/api/organizations','POST',{name:'运营部',parentId:root.id})).status,409);
+  const sameName=await create('运营部',other.id);
+  assert.equal((await admin.request('/api/organizations/'+root.id,'PUT',{name:'总部',parentId:leaf.id})).status,400);
+  assert.equal((await admin.request('/api/organizations/'+root.id,'PUT',{name:'总部',parentId:root.id})).status,400);
+  assert.equal((await admin.request('/api/organizations/'+root.id,'DELETE')).status,409);
+  const input={username:'organization.member',password:'fixture-password',displayName:'多机构成员',role:'user',enabled:true,organizationIds:[root.id,leaf.id,other.id,leaf.id]};
+  for(const organizationIds of [undefined,[],null,'wrong',[7],[''],['missing']])assert.equal((await admin.request('/api/users','POST',{...input,organizationIds})).status,400);
+  const created=await admin.request('/api/users','POST',input);assert.equal(created.status,201);const id=created.body.id;
+  assert.deepEqual(new Set(created.body.organizationIds),new Set([root.id,leaf.id,other.id]));
+  await member.request('/api/auth/login','POST',{username:input.username,password:input.password});
+  for(const [route,method,data] of [['/api/organizations','GET'],['/api/organizations','POST',{name:'禁止'}],['/api/organizations/'+root.id,'PUT',{name:'禁止'}],['/api/organizations/'+leaf.id,'DELETE']])assert.equal((await member.request(route,method,data)).status,403);
+  assert.equal((await admin.request('/api/organizations/'+leaf.id,'DELETE')).status,409);
+  for(const organizationIds of [undefined,[],['missing']])assert.equal((await admin.request('/api/users/'+id,'PUT',{...input,password:'',organizationIds})).status,400);
+  assert.deepEqual(new Set((await member.request('/api/auth/me')).body.organizationIds),new Set([root.id,leaf.id,other.id]));
+  const updated=await admin.request('/api/users/'+id,'PUT',{...input,password:'',organizationIds:[child.id,leaf.id]});assert.equal(updated.status,200);
+  assert.deepEqual(new Set(updated.body.organizationIds),new Set([child.id,leaf.id]));
+  assert.equal((await admin.request('/api/organizations/'+child.id,'PUT',{name:'运营中心',parentId:other.id})).status,200);
+  await s.stop();await s.start();
+  assert.deepEqual(new Set((await member.request('/api/auth/me')).body.organizationIds),new Set([child.id,leaf.id]));
+  const list=(await admin.request('/api/organizations')).body;
+  assert.equal(list.find(o=>o.id===child.id).parentId,other.id);assert.equal(list.find(o=>o.id===child.id).name,'运营中心');
+  await admin.request('/api/users/'+id,'DELETE');
+  assert.equal((await admin.request('/api/organizations/'+leaf.id,'DELETE')).status,200);
+  assert.equal((await admin.request('/api/organizations/'+child.id,'DELETE')).status,200);
+  assert.equal((await admin.request('/api/organizations/'+sameName.id,'DELETE')).status,200);
+  assert.equal((await admin.request('/api/organizations/'+other.id,'DELETE')).status,200);
+  assert.equal((await admin.request('/api/organizations/'+root.id,'DELETE')).status,200);
+  assert.equal((await admin.request('/api/organizations/missing','PUT',{name:'不存在'})).status,404);
+ }finally{await s.close();}
+});
+
+test('旧 SQLite 用户和会话自动保留并分配默认机构，重启不覆盖多机构归属',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-organization-migration-'));
+ try{
+  const sql=new DatabaseSync(path.join(dir,'workbench.sqlite'));
+  sql.exec(`CREATE TABLE metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    INSERT INTO metadata VALUES ('initialized','1');
+    CREATE TABLE users (id TEXT PRIMARY KEY,username TEXT NOT NULL UNIQUE COLLATE NOCASE,displayName TEXT NOT NULL,passwordHash TEXT NOT NULL,role TEXT NOT NULL,enabled INTEGER NOT NULL,createdAt TEXT NOT NULL);
+    CREATE TABLE sessions (tokenHash TEXT PRIMARY KEY,userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expiresAt INTEGER NOT NULL);`);
+  sql.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?)').run('legacy-user','legacy.fixture','旧用户','fixture-hash','admin',1,'2026-01-01');
+  sql.prepare('INSERT INTO sessions VALUES (?,?,?)').run('fixture-session-hash','legacy-user',Date.now()+100000);sql.close();
+  let store=await openStore(dir);
+  const user=store.sql.prepare('SELECT * FROM users').get();assert.equal(user.passwordHash,'fixture-hash');assert.equal(user.createdAt,'2026-01-01');
+  assert.deepEqual(store.userView(user).organizationIds,['default-organization']);
+  assert.equal(store.sql.prepare('SELECT count(*) AS n FROM sessions').get().n,1);
+  store.sql.prepare('INSERT INTO organizations VALUES (?,?,?,?)').run('custom','新机构',null,'2026-01-01');
+  store.sql.prepare('UPDATE user_organizations SET organizationId=?').run('custom');
+  store.sql.prepare('DELETE FROM organizations WHERE id=?').run('default-organization');store.sql.close();
+  store=await openStore(dir);assert.deepEqual(store.userView(user).organizationIds,['custom']);assert.equal(store.sql.prepare('SELECT count(*) AS n FROM organizations').get().n,1);store.sql.close();
  }finally{await rm(dir,{recursive:true,force:true});}
 });

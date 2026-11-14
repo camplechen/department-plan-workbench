@@ -27,7 +27,9 @@ export async function openStore(dir) {
   const sql = new DatabaseSync(path.join(dir, 'workbench.sqlite'));
   sql.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS organizations (id TEXT PRIMARY KEY, name TEXT NOT NULL, parentId TEXT REFERENCES organizations(id), createdAt TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, displayName TEXT NOT NULL, passwordHash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','user')), enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), createdAt TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS user_organizations (userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, organizationId TEXT NOT NULL REFERENCES organizations(id), PRIMARY KEY(userId,organizationId));
     CREATE TABLE IF NOT EXISTS sessions (tokenHash TEXT PRIMARY KEY, userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expiresAt INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS login_attempts (username TEXT PRIMARY KEY, attempts INTEGER NOT NULL, expiresAt INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS session_expiry ON sessions(expiresAt);
@@ -42,6 +44,14 @@ export async function openStore(dir) {
   const insert = (table, fields, record) => sql.prepare(`INSERT INTO ${table} (id,${fields.join(',')}) VALUES (${fields.map(()=>'?').join(',')},?)`).run(record.id,...fields.map(f=>record[f] ?? (f==='progress'?0:'')));
   const legacyFile = path.join(dir, 'workbench.json');
   try {
+    // 旧用户归入默认机构，保留密码、会话和业务数据；以后不重复分配。
+    transaction(()=>{
+      if(!sql.prepare("SELECT 1 FROM metadata WHERE key='organizationsInitialized'").get()){
+        sql.prepare('INSERT INTO organizations VALUES (?,?,NULL,?)').run('default-organization','默认机构',new Date().toISOString());
+        sql.prepare('INSERT INTO user_organizations SELECT id,? FROM users').run('default-organization');
+        sql.prepare('INSERT INTO metadata VALUES (?,?)').run('organizationsInitialized','1');
+      }
+    });
     if (!sql.prepare("SELECT 1 FROM metadata WHERE key='initialized'").get()) {
       let legacy;
       try {legacy=JSON.parse(await readFile(legacyFile,'utf8'));}
@@ -59,6 +69,7 @@ export async function openStore(dir) {
           }
         }
         sql.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?)').run(seed.id,seed.username,seed.displayName,seed.passwordHash,seed.role,seed.enabled,seed.createdAt);
+        sql.prepare('INSERT INTO user_organizations VALUES (?,?)').run(seed.id,'default-organization');
         sql.prepare('INSERT INTO metadata VALUES (?,?)').run('initialized','1');
         if(legacy)sql.prepare('INSERT INTO metadata VALUES (?,?)').run('legacyImported','1');
       });
@@ -75,6 +86,7 @@ export async function openStore(dir) {
   } catch(error) {sql.close(); throw error;}
   return {
     sql, transaction,
+    userView(user) {return {...publicUser(user),organizationIds:sql.prepare('SELECT organizationId FROM user_organizations WHERE userId=? ORDER BY organizationId').all(user.id).map(row=>row.organizationId)};},
     readData() {
       const bases=sql.prepare('SELECT * FROM bases ORDER BY rowid DESC').all();
       const links=sql.prepare('SELECT * FROM plan_bases ORDER BY position').all();
