@@ -1,0 +1,11 @@
+import {cp,mkdir,rm} from 'node:fs/promises';
+import {build} from 'esbuild';
+await mkdir('public/vendor',{recursive:true});
+await rm('public/vendor/tinymce',{recursive:true,force:true});
+await cp('node_modules/tinymce','public/vendor/tinymce',{recursive:true});
+await mkdir('public/vendor/tinymce/langs',{recursive:true});
+await cp('node_modules/tinymce-i18n/langs8/zh-CN.js','public/vendor/tinymce/langs/zh-CN.js');
+await cp('node_modules/tinymce-i18n/LICENSE.md','public/vendor/tinymce/langs/LICENSE.md');
+await cp('node_modules/tinymce-i18n/NOTICE.md','public/vendor/tinymce/langs/NOTICE.md');
+await build({entryPoints:['src/rich-text.js'],outfile:'public/rich-text.js',bundle:true,format:'esm',platform:'browser',minify:true,legalComments:'eof'});
+console.log('本地编辑器、中文语言包及过滤模块已生成');

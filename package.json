@@ -1,0 +1,25 @@
+{
+  "name": "department-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "build:vendor": "node scripts/build-vendor.mjs",
+    "postinstall": "npm run build:vendor"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "sanitize-html": "^2.18.2",
+    "tinymce": "^8.10.2",
+    "tinymce-i18n": "^26.11.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  },
+  "description": "中文部门计划工作台：计划管理、制定依据关联、图文编辑与本地数据保存",
+  "license": "GPL-3.0-or-later"
+}
