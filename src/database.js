@@ -1,11 +1,12 @@
 import {DatabaseSync} from 'node:sqlite';
-import {mkdir, readFile, rename, access} from 'node:fs/promises';
+import {mkdir, readFile, rename, access, cp, rm, readdir} from 'node:fs/promises';
 import {randomBytes, randomUUID, scrypt, timingSafeEqual, createHash} from 'node:crypto';
 import {promisify} from 'node:util';
 import path from 'node:path';
 
 const derive = promisify(scrypt);
 const planFields = ['title','department','owner','start','due','goal','tasks','priority','status','progress','createdAt','updatedAt'];
+const ownershipFields=['ownerUserId','organizationId'];
 const basisFields = ['title','category','source','date','content','createdAt','updatedAt'];
 export const sessionSeconds = 30 * 24 * 60 * 60;
 export const fail = (message, status = 400) => Object.assign(new Error(message), {status});
@@ -24,6 +25,21 @@ export const publicUser = user => ({id:user.id, username:user.username, displayN
 
 export async function openStore(dir) {
   await mkdir(dir, {recursive:true});
+  // 在任何升级写入之前保存完整数据快照，排除历史备份，SQLite 使用一致性备份。
+  let previous;
+  try {await access(path.join(dir,'workbench.sqlite'));previous=new DatabaseSync(path.join(dir,'workbench.sqlite'),{readOnly:true});}catch(error){if(error.code!=='ENOENT')throw error;}
+  try {
+    const initialized=previous?.prepare("SELECT 1 FROM sqlite_master WHERE name='metadata'").get()&&previous.prepare("SELECT 1 FROM metadata WHERE key='planOwnershipInitialized'").get();
+    let legacy=false;try{await access(path.join(dir,'workbench.json'));legacy=true;}catch(error){if(error.code!=='ENOENT')throw error;}
+    if(!initialized&&(previous||legacy)){
+      const destination=path.join(dir,'backups','计划权限升级前_'+new Date().toISOString().replace(/[:.]/g,'-')+'_'+randomUUID());
+      await mkdir(destination,{recursive:true});
+      try {
+        for(const name of await readdir(dir))if(name!=='backups'&&!/^workbench\.sqlite(?:-wal|-shm|-journal)?$/.test(name))await cp(path.join(dir,name),path.join(destination,name),{recursive:true});
+        if(previous)previous.prepare('VACUUM INTO ?').run(path.join(destination,'workbench.sqlite'));
+      }catch(error){await rm(destination,{recursive:true,force:true});throw error;}
+    }
+  }finally{previous?.close();}
   const sql = new DatabaseSync(path.join(dir, 'workbench.sqlite'));
   sql.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -41,7 +57,7 @@ export async function openStore(dir) {
     try {const result=fn(); sql.exec('COMMIT'); return result;}
     catch(error) {sql.exec('ROLLBACK'); throw error;}
   };
-  const insert = (table, fields, record) => sql.prepare(`INSERT INTO ${table} (id,${fields.join(',')}) VALUES (${fields.map(()=>'?').join(',')},?)`).run(record.id,...fields.map(f=>record[f] ?? (f==='progress'?0:'')));
+  const insert = (table, fields, record) => sql.prepare(`INSERT INTO ${table} (id,${fields.join(',')}) VALUES (${fields.map(()=>'?').join(',')},?)`).run(record.id,...fields.map(f=>record[f] ?? (f==='progress'?0:ownershipFields.includes(f)?null:'')));
   const legacyFile = path.join(dir, 'workbench.json');
   try {
     // 旧用户归入默认机构，保留密码、会话和业务数据；以后不重复分配。
@@ -74,6 +90,25 @@ export async function openStore(dir) {
         if(legacy)sql.prepare('INSERT INTO metadata VALUES (?,?)').run('legacyImported','1');
       });
     }
+    transaction(()=>{
+      const columns=sql.prepare('PRAGMA table_info(plans)').all().map(c=>c.name);
+      if(!columns.includes('ownerUserId'))sql.exec('ALTER TABLE plans ADD COLUMN ownerUserId TEXT REFERENCES users(id) ON DELETE SET NULL');
+      if(!columns.includes('organizationId'))sql.exec('ALTER TABLE plans ADD COLUMN organizationId TEXT REFERENCES organizations(id) ON DELETE SET NULL');
+      sql.exec('CREATE TABLE IF NOT EXISTS uploads (name TEXT PRIMARY KEY,userId TEXT REFERENCES users(id) ON DELETE SET NULL)');
+      if(!sql.prepare("SELECT 1 FROM metadata WHERE key='planOwnershipInitialized'").get()){
+        const users=sql.prepare('SELECT id,username,displayName FROM users').all();
+        for(const p of sql.prepare('SELECT * FROM plans WHERE ownerUserId IS NULL').all()){
+          const matches=users.filter(u=>p.owner.trim()&&(u.displayName===p.owner.trim()||u.username.toLowerCase()===p.owner.trim().toLowerCase()));
+          if(matches.length!==1)continue;
+          const owner=matches[0];
+          const orgs=sql.prepare('SELECT o.id,o.name FROM organizations o JOIN user_organizations m ON m.organizationId=o.id WHERE m.userId=?').all(owner.id);
+          const matching=orgs.filter(o=>o.name===p.department);
+          const org=matching.length===1?matching[0]:orgs.length===1?orgs[0]:null;
+          sql.prepare('UPDATE plans SET ownerUserId=?,organizationId=coalesce(organizationId,?) WHERE id=?').run(owner.id,org?.id??null,p.id);
+        }
+        sql.prepare('INSERT INTO metadata VALUES (?,?)').run('planOwnershipInitialized','1');
+      }
+    });
     if(sql.prepare("SELECT 1 FROM metadata WHERE key='legacyImported'").get()) {
       try {
         await access(legacyFile);
@@ -95,9 +130,9 @@ export async function openStore(dir) {
     },
     writeRecord(type,record,isNew) {
       transaction(()=>{
-        const fields=type==='plans'?planFields:basisFields;
+        const fields=type==='plans'?[...planFields,...ownershipFields]:basisFields;
         if(isNew)insert(type,fields,record);
-        else sql.prepare(`UPDATE ${type} SET ${fields.map(f=>f+'=?').join(',')} WHERE id=?`).run(...fields.map(f=>record[f] ?? (f==='progress'?0:'')),record.id);
+        else sql.prepare(`UPDATE ${type} SET ${fields.map(f=>f+'=?').join(',')} WHERE id=?`).run(...fields.map(f=>record[f] ?? (f==='progress'?0:ownershipFields.includes(f)?null:'')),record.id);
         if(type==='plans') {
           sql.prepare('DELETE FROM plan_bases WHERE planId=?').run(record.id);
           record.basisIds.forEach((id,index)=>sql.prepare('INSERT INTO plan_bases VALUES (?,?,?)').run(record.id,id,index));

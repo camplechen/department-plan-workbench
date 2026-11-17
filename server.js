@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {permissionScope,filterPlans} from './src/permissions.js';
 import {sanitizeHTML,hasText} from './public/rich-text.js';
 import {readFile,writeFile,mkdir} from 'node:fs/promises';
 import {openStore,fail,hashPassword,verifyPassword,sessionSeconds} from './src/database.js';
@@ -20,7 +21,7 @@ if(process.env.APP_ORIGIN){
 const store=await openStore(dir);
 function validate(type,b,db){
  if(!b || typeof b!=='object' || Array.isArray(b))throw fail('提交内容格式不正确');
- const fields=type==='plans'?['title','department','owner','start','due','goal','tasks','priority','status','progress','basisIds']:['title','category','source','date','content'];
+ const fields=type==='plans'?['title','department','owner','ownerUserId','organizationId','start','due','goal','tasks','priority','status','progress','basisIds']:['title','category','source','date','content'];
  const v=Object.fromEntries(fields.filter(k=>b[k]!==undefined).map(k=>[k,b[k]]));
  const required=type==='plans'?['title','department','owner','start','due','goal']:['title','category','content'];
  for(const k of fields)if(k!=='basisIds'&&k!=='progress'&&v[k]!==undefined&&(typeof v[k]!=='string'||v[k].length>(['goal','tasks'].includes(k)?500000:10000)))throw fail('字段格式不正确或内容过长');
@@ -57,7 +58,14 @@ const server=http.createServer(async(req,res)=>{
  };
  if(url.pathname==='/'&&!user){res.writeHead(302,{Location:'/login'});return res.end();}
  if(url.pathname==='/login'&&user){res.writeHead(302,{Location:'/'});return res.end();}
- if(url.pathname.startsWith('/uploads/'))requireUser();
+ const scope=()=>permissionScope(store,store.session(sessionToken));
+ const imageAllowed=location=>{
+   const current=store.session(sessionToken);if(!current)return false;if(current.role==='admin')return true;
+   const plans=store.readData().plans.filter(p=>[p.goal,p.tasks].some(html=>sanitizeHTML(html).includes(`src="${location}"`)));
+   if(plans.length)return plans.some(p=>scope().canPlan(p));
+   return store.sql.prepare('SELECT 1 FROM uploads WHERE name=? AND userId=?').get(location.slice(9),current.id);
+ };
+ if(url.pathname.startsWith('/uploads/')){requireUser();if(!imageAllowed(url.pathname))throw fail('无权读取图片',403);}
  if(url.pathname.startsWith('/api/')){
  checkOrigin();
  if(url.pathname==='/api/auth/login'&&req.method==='POST') {
@@ -163,7 +171,10 @@ const server=http.createServer(async(req,res)=>{
  }
 
  const db=store.readData();
- if(req.method==='GET'&&url.pathname==='/api/data')return send(200,{...db,plans:db.plans.map(p=>({...p,goal:sanitizeHTML(p.goal),tasks:sanitizeHTML(p.tasks)}))});
+ if(req.method==='GET'&&url.pathname==='/api/plan-scope'){
+   const access=scope();return send(200,{organizations:access.organizations,people:access.people});
+ }
+ if(req.method==='GET'&&url.pathname==='/api/data')return send(200,{...db,plans:filterPlans(db.plans,scope(),url.searchParams).map(p=>({...p,goal:sanitizeHTML(p.goal),tasks:sanitizeHTML(p.tasks)}))});
  if(url.pathname==='/api/uploads'){
  if(req.method!=='POST')throw fail('请求方式不支持',405);
  const type=(req.headers['content-type']||'').split(';')[0].trim();
@@ -175,23 +186,39 @@ const server=http.createServer(async(req,res)=>{
  const valid=type==='image/png'?image.length>=24&&image.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))&&image.toString('ascii',12,16)==='IHDR':type==='image/jpeg'?image.length>=4&&image[0]===255&&image[1]===216&&image[2]===255:type==='image/gif'?image.length>=13&&/^GIF8[79]a$/.test(image.toString('ascii',0,6)):image.length>=16&&image.toString('ascii',0,4)==='RIFF'&&image.toString('ascii',8,12)==='WEBP';
  if(!valid)throw fail('图片文件内容与类型不符',415);
  requireUser();const name=randomUUID()+'.'+extensions[type];await mkdir(uploadDir,{recursive:true});await writeFile(path.join(uploadDir,name),image,{flag:'wx'});
+ store.sql.prepare('INSERT INTO uploads VALUES (?,?)').run(name,store.session(sessionToken).id);
  return send(201,{location:'/uploads/'+name});
  }
  const m=url.pathname.match(/^\/api\/(plans|bases)(?:\/([\w-]+))?$/);if(!m)throw fail('接口不存在',404);
- if(!['POST','PUT','DELETE'].includes(req.method))throw fail('请求方式不支持',405);
- const input=await inputJSON();requireUser();
- const [,type,id]=m;const snapshot=store.readData();const existing=snapshot[type].find(x=>x.id===id);
+ if(!['GET','POST','PUT','DELETE'].includes(req.method))throw fail('请求方式不支持',405);
+ const input=req.method==='GET'?null:await inputJSON();requireUser();
+ const [,type,id]=m;const snapshot=store.readData();const existing=snapshot[type].find(x=>x.id===id);const access=scope();
  if(req.method!=='POST'&&!existing)throw fail('记录不存在',404);
+ if(type==='plans'&&existing&&!access.canPlan(existing))throw fail('无权访问该计划',403);
+ if(req.method==='GET')return send(200,type==='plans'?{...existing,goal:sanitizeHTML(existing.goal),tasks:sanitizeHTML(existing.tasks)}:{...existing,plans:snapshot.plans.filter(p=>access.canPlan(p)&&p.basisIds.includes(id)).map(p=>({...p,goal:sanitizeHTML(p.goal),tasks:sanitizeHTML(p.tasks)}))});
+ if(req.method==='POST'&&id)throw fail('请求方式不支持',405);
  if(req.method==='DELETE'){
    if(type==='bases'&&snapshot.plans.some(p=>p.basisIds.includes(id)))throw fail('该依据仍被计划引用，请先在关联计划中移除关联',409);
    store.deleteRecord(type,id);return send(200,{message:'已删除'});
+ }
+ if(type==='plans'){
+   const ownerId=input.ownerUserId??(existing?existing.ownerUserId:user.id);
+   if(typeof ownerId!=='string'||!access.canUser(ownerId))throw fail('无权为该负责人保存计划',403);
+   const owner=store.sql.prepare('SELECT id,displayName FROM users WHERE id=?').get(ownerId);
+   if(!owner)throw fail('负责人不存在');
+   // 负责人必须显式绑定用户，部门必须属于该用户；不信任展示用文本。
+   const organizationId=input.organizationId;
+   if(typeof organizationId!=='string'||!store.sql.prepare('SELECT 1 FROM user_organizations WHERE userId=? AND organizationId=?').get(ownerId,organizationId))throw fail('请选择负责人所属的机构');
+   const organization=store.sql.prepare('SELECT name FROM organizations WHERE id=?').get(organizationId);
+   Object.assign(input,{ownerUserId:ownerId,organizationId,owner:owner.displayName,department:organization.name});
+   for(const html of [input.goal,input.tasks])for(const match of sanitizeHTML(html).matchAll(/src="(\/uploads\/[^"]+)"/g))if(!imageAllowed(match[1]))throw fail('无权引用该图片',403);
  }
  const value=validate(type,input,snapshot);const now=new Date().toISOString();
  const record={...value,id:req.method==='POST'?randomUUID():id,createdAt:req.method==='POST'?now:existing.createdAt,updatedAt:now};
  store.writeRecord(type,record,req.method==='POST');return send(req.method==='POST'?201:200,record);
  }
  if(req.method!=='GET')throw fail('请求方式不支持',405);
- const files={'/login':'login.html','/login.js':'login.js','/':'index.html','/app.js':'app.js','/style.css':'style.css','/editor-content.css':'editor-content.css','/rich-text.js':'rich-text.js','/rich-editor.js':'rich-editor.js'};
+ const files={'/login':'login.html','/login.js':'login.js','/':'index.html','/app.js':'app.js','/plan-tree.js':'plan-tree.js','/style.css':'style.css','/editor-content.css':'editor-content.css','/rich-text.js':'rich-text.js','/rich-editor.js':'rich-editor.js'};
  let name=files[url.pathname],location;
  if(/^\/uploads\/[a-f0-9-]{36}\.(png|jpg|jpeg|gif|webp)$/.test(url.pathname)) {name=url.pathname.slice(9);location=path.join(uploadDir,name);}
  else if(/^\/vendor\/[a-zA-Z0-9_./-]+$/.test(url.pathname)&&!url.pathname.split('/').includes('..')){name=url.pathname.slice(1);location=path.join(root,'public',name);}

@@ -14,14 +14,14 @@ test('依据与计划的完整生命周期、删除保护、重启保存及非�
  const legacy={id:'legacy',title:'历史计划',goal:'第一行 & 内容\n第二行',tasks:'旧行动\n旧进展',basisIds:[]};
  await writeFile(path.join(dir,'workbench.json'),JSON.stringify({plans:[legacy],bases:[]}));
  await start();
- await api('/api/auth/login','POST',{username:'admin',password:'admin'});
+ const account=(await api('/api/auth/login','POST',{username:'admin',password:'admin'})).body;
  const legacyData=(await api('/api/data')).body.plans[0];
  assert.equal(legacyData.goal,'<p>第一行 &amp; 内容<br>第二行</p>');
  await assert.rejects(readFile(path.join(dir,'workbench.json')),error=>error.code==='ENOENT');
  assert.equal(JSON.parse(await readFile(path.join(dir,'workbench.json.migrated.bak'),'utf8')).plans[0].goal,legacy.goal);
  const storedPlans=()=>{const sql=new DatabaseSync(path.join(dir,'workbench.sqlite'),{readOnly:true});try{return sql.prepare('SELECT * FROM plans').all();}finally{sql.close();}};
  await api('/api/plans/legacy','DELETE');const b=await api('/api/bases','POST',{title:'季度目标',category:'战略目标',content:'提升交付质量',date:'2026-11-12',source:'季度会议'});assert.equal(b.status,201);
- const input={title:'建立交付复盘机制',department:'运营部',owner:'负责人',start:'2026-11-12',due:'2026-12-12',priority:'高',status:'进行中',progress:20,goal:'每周复盘',tasks:'整理问题',basisIds:[b.body.id]};
+ const input={ownerUserId:account.id,organizationId:account.organizationIds[0],title:'建立交付复盘机制',department:'运营部',owner:'负责人',start:'2026-11-12',due:'2026-12-12',priority:'高',status:'进行中',progress:20,goal:'每周复盘',tasks:'整理问题',basisIds:[b.body.id]};
  const p=await api('/api/plans','POST',input);assert.equal(p.status,201);assert.equal((await api('/api/bases/'+b.body.id,'DELETE')).status,409);
  assert.equal((await api('/api/plans','POST',{...input,due:'2026-01-01'})).status,400);
  assert.equal((await api('/api/plans','POST',{...input,basisIds:['missing']})).status,400);

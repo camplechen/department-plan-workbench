@@ -1,10 +1,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn,spawnSync} from 'node:child_process';
-import {mkdtemp,rm,writeFile,readFile} from 'node:fs/promises';
+import {mkdtemp,rm,writeFile,readFile,readdir,mkdir} from 'node:fs/promises';
 import {DatabaseSync} from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
+import {matchesTree} from '../public/plan-tree.js';
 import {openStore} from '../src/database.js';
 
 async function service(environment={}){
@@ -195,5 +196,112 @@ test('旧 SQLite 用户和会话自动保留并分配默认机构，重启不覆
   store.sql.prepare('UPDATE user_organizations SET organizationId=?').run('custom');
   store.sql.prepare('DELETE FROM organizations WHERE id=?').run('default-organization');store.sql.close();
   store=await openStore(dir);assert.deepEqual(store.userView(user).organizationIds,['custom']);assert.equal(store.sql.prepare('SELECT count(*) AS n FROM organizations').get().n,1);store.sql.close();
+ }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('计划数据权限：平级隔离、下级及多机构并集、树筛选、越权读写、图片和依据详情',async()=>{
+ const s=await service();try{
+  const admin=s.client();await admin.request('/api/auth/login','POST',{username:'admin',password:'admin'});
+  const org=async(name,parentId=null)=>(await admin.request('/api/organizations','POST',{name,parentId})).body;
+  const root=await org('总部'),a=await org('运营',root.id),a1=await org('运营一组',a.id),a2=await org('运营二组',a.id),b=await org('研发',root.id),b1=await org('研发一组',b.id),outside=await org('外部');
+  const create=async(name,organizationIds)=>{
+   const input={username:name,password:'fixture-only',displayName:name,organizationIds,role:'user',enabled:true};
+   const response=await admin.request('/api/users','POST',input);assert.equal(response.status,201);
+   const client=s.client();await client.request('/api/auth/login','POST',{username:name,password:input.password});return {...response.body,client,input};
+  };
+  const leader=await create('leader',[a.id,a1.id,b.id]),peer=await create('peer',[a.id]),worker=await create('worker',[a1.id]),workerPeer=await create('worker.peer',[a1.id]),lower=await create('lower',[a2.id]),research=await create('research',[b1.id]),outsider=await create('outsider',[outside.id]);
+  const basis=(await admin.request('/api/bases','POST',{title:'共同依据',category:'其他',content:'共享依据正文'})).body;
+  const planInput={title:'权限测试',goal:'目标',tasks:'行动',start:'2026-11-01',due:'2026-11-02',priority:'中',status:'进行中',progress:10,basisIds:[basis.id]};
+  const save=async(owner,client=owner.client)=>{
+   const response=await client.request('/api/plans','POST',{...planInput,title:owner.displayName+' 的计划',ownerUserId:owner.id,organizationId:owner.organizationIds[0],owner:'伪造负责人',department:'伪造机构'});
+   assert.equal(response.status,201);assert.equal(response.body.owner,owner.displayName);return response.body;
+  };
+  const people=[leader,peer,worker,workerPeer,lower,research,outsider],plans=[];
+  for(const person of people)plans.push(await save(person));
+  const ids=async client=>(await client.request('/api/data')).body.plans.map(p=>p.ownerUserId).sort();
+  assert.deepEqual(await ids(worker.client),[worker.id]);assert.deepEqual(await ids(workerPeer.client),[workerPeer.id]);assert.deepEqual(await ids(peer.client),[peer.id,leader.id,worker.id,workerPeer.id,lower.id].sort());
+  assert.deepEqual(await ids(leader.client),[leader.id,worker.id,workerPeer.id,lower.id,research.id].sort());
+  assert.equal((await admin.request('/api/data')).body.plans.length,7);
+  const forbidden=plans[1];
+  for(const [route,method,data] of [['/api/plans/'+forbidden.id,'GET'],['/api/plans/'+forbidden.id,'PUT',{...forbidden,title:'越权改动'}],['/api/plans/'+forbidden.id,'DELETE']]){
+   const response=await leader.client.request(route,method,data);assert.equal(response.status,403);assert.ok(!JSON.stringify(response.body).includes(forbidden.title));
+  }
+  assert.equal((await worker.client.request('/api/plans','POST',{...planInput,ownerUserId:workerPeer.id,organizationId:a1.id})).status,403);
+  assert.equal((await leader.client.request('/api/plans','POST',{...planInput,ownerUserId:peer.id,organizationId:a.id})).status,403);
+  assert.equal((await worker.client.request('/api/plans','POST',{...planInput,organizationId:a.id})).status,400);
+  assert.equal((await worker.client.request('/api/plans','POST',{...planInput,organizationId:a1.id})).body.ownerUserId,worker.id);
+  const delegated=await save(worker,leader.client);assert.equal((await leader.client.request('/api/plans/'+delegated.id,'PUT',{...delegated,title:'上级修改'})).status,200);
+  assert.equal((await leader.client.request('/api/plans/'+delegated.id,'DELETE')).status,200);
+  const scope=(await worker.client.request('/api/plan-scope')).body;
+  assert.deepEqual(scope.people.map(u=>u.id),[worker.id]);assert.deepEqual(new Set(scope.organizations.map(o=>o.id)),new Set([root.id,a.id,a1.id]));
+  assert.ok(scope.people.every(u=>!('username' in u)&&!('passwordHash' in u)));
+  const leaderScope=(await leader.client.request('/api/plan-scope')).body;
+  assert.ok(!leaderScope.people.some(u=>u.id===peer.id||u.id===outsider.id));assert.ok(!leaderScope.organizations.some(o=>o.id===outside.id));
+  assert.equal((await admin.request('/api/plan-scope')).body.people.length,8);
+  const all=(await leader.client.request('/api/data')).body.plans;
+  for(const selection of [{type:'organization',id:a.id},{type:'organization',id:a1.id},{type:'person',id:worker.id}]){
+   const query=selection.type==='person'?'ownerUserId':'organizationId';
+   const filtered=(await leader.client.request('/api/data?'+query+'='+selection.id)).body.plans;
+   assert.deepEqual(filtered.map(p=>p.id),all.filter(p=>matchesTree(p,selection,leaderScope.organizations)).map(p=>p.id));
+  }
+  assert.equal((await leader.client.request('/api/data?ownerUserId='+peer.id)).body.plans.length,0);
+  const detail=(await worker.client.request('/api/bases/'+basis.id)).body;assert.ok(detail.plans.length);assert.ok(detail.plans.every(p=>p.ownerUserId===worker.id));assert.ok(!JSON.stringify(detail).includes(forbidden.title));
+  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aB1cAAAAASUVORK5CYII=','base64');
+  const uploaded=await fetch(s.url()+'/api/uploads',{method:'POST',headers:{Cookie:worker.client.cookie,'Content-Type':'image/png'},body:png});const {location}=await uploaded.json();
+  assert.equal((await outsider.client.request(location)).status,403);
+  const illustrated=await worker.client.request('/api/plans','POST',{...planInput,organizationId:a1.id,goal:`<p>私有图片</p><img src="${location}">`});assert.equal(illustrated.status,201);
+  assert.equal((await leader.client.request(location)).status,200);assert.equal((await workerPeer.client.request(location)).status,403);
+  assert.equal((await workerPeer.client.request('/api/plans','POST',{...planInput,organizationId:a1.id,goal:`<p>盗用图片</p><img src="${location}">`})).status,403);
+  await s.stop();await s.start();assert.equal((await workerPeer.client.request(location)).status,403);assert.equal((await leader.client.request('/api/plans/'+illustrated.body.id)).status,200);
+  // 组织变化立即改变权限，不依赖重新登录或客户端树。
+  await admin.request('/api/users/'+leader.id,'PUT',{...leader.input,password:'',organizationIds:[outside.id]});
+  assert.equal((await leader.client.request('/api/plans/'+illustrated.body.id)).status,403);assert.equal((await leader.client.request(location)).status,403);
+  assert.equal((await admin.request('/api/plans/'+illustrated.body.id,'DELETE')).status,200);
+  assert.equal((await admin.request('/api/plans','POST',{...planInput,ownerUserId:worker.id,organizationId:outside.id})).status,400);
+  await admin.request('/api/users/'+outsider.id,'DELETE');
+  const orphan=plans.find(p=>p.ownerUserId===outsider.id);
+  assert.equal((await worker.client.request('/api/plans/'+orphan.id)).status,403);
+  assert.equal((await admin.request('/api/plans/'+orphan.id)).body.ownerUserId,null);
+  assert.equal((await admin.request('/api/plans/'+orphan.id,'PUT',{...orphan,ownerUserId:worker.id,organizationId:a1.id})).status,200);
+  assert.equal((await worker.client.request('/api/plans/'+orphan.id)).status,200);
+
+ }finally{await s.close();}
+});
+
+test('计划归属升级备份、唯一匹配与未归属、事务回滚和重复启动不覆盖',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-owner-migration-'));
+ try{
+  let store=await openStore(dir);const admin=store.sql.prepare('SELECT * FROM users').get();
+  const plan=(id,owner,ownerUserId=null)=>({id,title:id,owner,department:'默认机构',ownerUserId,organizationId:null,goal:'保留正文',tasks:'',start:'',due:'',priority:'中',status:'草稿',progress:0,basisIds:[],createdAt:'旧时间',updatedAt:'旧时间'});
+  store.writeRecord('plans',plan('unique','管理员'),true);store.writeRecord('plans',plan('ambiguous','同名'),true);store.writeRecord('plans',plan('unmatched','无人匹配'),true);store.writeRecord('plans',plan('bound','无人匹配',admin.id),true);
+  for(const id of ['one','two'])store.sql.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?)').run(id,id,'同名','fixture-hash','user',1,'旧时间');
+  store.sql.prepare("DELETE FROM metadata WHERE key='planOwnershipInitialized'").run();
+  store.sql.exec('ALTER TABLE plans DROP COLUMN organizationId');store.sql.exec('ALTER TABLE plans DROP COLUMN ownerUserId');
+  store.sql.exec("CREATE TRIGGER fail_owner BEFORE UPDATE OF ownerUserId ON plans WHEN new.id='unique' BEGIN SELECT RAISE(ABORT,'fixture migration failure'); END");
+  store.sql.close();
+  await mkdir(path.join(dir,'uploads'));await writeFile(path.join(dir,'uploads','fixture.txt'),'本地图片占位');await mkdir(path.join(dir,'backups','historic'),{recursive:true});await writeFile(path.join(dir,'backups','historic','old.txt'),'历史备份');
+  await assert.rejects(openStore(dir),/fixture migration failure/);
+  const sql=new DatabaseSync(path.join(dir,'workbench.sqlite'));assert.ok(!sql.prepare('PRAGMA table_info(plans)').all().some(c=>c.name==='ownerUserId'));assert.equal(sql.prepare("SELECT 1 FROM metadata WHERE key='planOwnershipInitialized'").get(),undefined);sql.exec('DROP TRIGGER fail_owner');sql.close();
+  store=await openStore(dir);let data=store.readData().plans;
+  assert.equal(data.find(p=>p.id==='unique').ownerUserId,admin.id);assert.equal(data.find(p=>p.id==='unique').organizationId,'default-organization');
+  assert.equal(data.find(p=>p.id==='ambiguous').ownerUserId,null);assert.equal(data.find(p=>p.id==='unmatched').ownerUserId,null);assert.equal(data.find(p=>p.id==='bound').ownerUserId,null);store.sql.prepare("UPDATE plans SET ownerUserId=? WHERE id='bound'").run(admin.id);assert.ok(data.every(p=>p.goal==='保留正文'&&p.updatedAt==='旧时间'));
+  const backups=(await readdir(path.join(dir,'backups'))).filter(n=>n.startsWith('计划权限升级前_'));assert.equal(backups.length,2);
+  const snapshot=path.join(dir,'backups',backups[0]);assert.equal(await readFile(path.join(snapshot,'uploads','fixture.txt'),'utf8'),'本地图片占位');assert.ok(!(await readdir(snapshot)).includes('backups'));
+  const saved=new DatabaseSync(path.join(snapshot,'workbench.sqlite'),{readOnly:true});assert.ok(!saved.prepare('PRAGMA table_info(plans)').all().some(c=>c.name==='ownerUserId'));saved.close();
+  store.sql.prepare("UPDATE users SET displayName='改名' WHERE id=?").run(admin.id);store.sql.close();store=await openStore(dir);assert.equal(store.readData().plans.find(p=>p.id==='unique').ownerUserId,admin.id);assert.equal(store.readData().plans.find(p=>p.id==='bound').ownerUserId,admin.id);assert.equal((await readdir(path.join(dir,'backups'))).filter(n=>n.startsWith('计划权限升级前_')).length,2);store.sql.close();
+ }finally{await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('已绑定计划不被迁移重配，备份失败时不进行归属升级',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'workbench-bound-migration-'));
+ try{
+  let store=await openStore(dir);const user=store.sql.prepare('SELECT id FROM users').get();
+  store.writeRecord('plans',{id:'bound',title:'保留',owner:'不存在的姓名',department:'历史部门',ownerUserId:user.id,organizationId:'default-organization',basisIds:[]},true);
+  store.sql.prepare("DELETE FROM metadata WHERE key='planOwnershipInitialized'").run();store.sql.close();
+  await writeFile(path.join(dir,'backups'),'阻止创建备份目录');await assert.rejects(openStore(dir));
+  let sql=new DatabaseSync(path.join(dir,'workbench.sqlite'),{readOnly:true});assert.equal(sql.prepare("SELECT 1 FROM metadata WHERE key='planOwnershipInitialized'").get(),undefined);assert.equal(sql.prepare('SELECT ownerUserId FROM plans').get().ownerUserId,user.id);sql.close();
+  await rm(path.join(dir,'backups'));store=await openStore(dir);const plan=store.readData().plans[0];assert.equal(plan.ownerUserId,user.id);assert.equal(plan.owner,'不存在的姓名');assert.equal(plan.department,'历史部门');assert.equal(plan.organizationId,'default-organization');store.sql.close();
  }finally{await rm(dir,{recursive:true,force:true});}
 });
