@@ -154,9 +154,46 @@ Node 服务只监听本机；云端使用 Nginx 在同机代理 HTTPS 入口，�
 - Nginx 代理到 `http://127.0.0.1:3210`，保留 Host，设置 `X-Forwarded-Proto`，上传大小限制至少设为 `12m`，使单张 10MB 图片可正常上传。不要将整个源码或数据目录作为网站根目录公开。
 - 建议使用 systemd 启动，`ExecStart` 使用 Node 的绝对路径；通过 NVM 升级或移动 Node 后需要更新服务路径。服务环境配置 `NODE_ENV=production`、`PORT=3210`、`DATA_DIR=/var/lib/department-plan-workbench` 和自己的 `APP_ORIGIN`；数据目录只允许服务用户访问。
 - 在公网开放应用前设置独立管理员密码；仅在 HTTPS 下通过浏览器登录。证书由 Nginx 使用，私钥只能保留在服务器本地，不能提交 Git 或发送到聊天。
-- 更新前停止服务并备份完整 `DATA_DIR`；确认服务器工作区干净后 `git pull --ff-only`、`npm ci`，在独立临时目录执行 `npm test`，成功后重启 systemd 服务。不要覆盖或删除已有数据目录。
+- 更新可使用下文的一条命令流程，先在独立目录构建测试，通过后停服备份完整 `DATA_DIR` 并切换代码。手动更新也应保留备份、测试及启动检查，不覆盖或删除已有数据目录。
 
 代码支持 HTTPS 代理不等于证书已部署；域名解析、证书申请和续期、Nginx / 系统防火墙配置及公网验收需在实际服务器上完成。当前架构采用单实例运行，共享 SQLite 文件的多节点部署不在本版本范围内。
+
+## 服务器一条命令更新
+
+在已按前文配置好 systemd 的 Linux 服务器上，可使用随项目提供的 `scripts/update-server.sh`。需要 root 权限，以及 Git、sudo、tar、curl、flock、timeout 和 Python 3；服务用户的 NVM / Node.js 环境保持可用。脚本不会操作开发电脑或自动推送 GitHub。
+
+首次先将包含该脚本的源码同步到服务器。然后在服务器 root 终端安装快捷命令（只需一次）：
+
+```sh
+bash /home/admin/apps/department-plan-workbench/scripts/update-server.sh --install
+```
+
+此路径对应本项目此前的服务器部署位置，其他安装目录请替换为实际路径。以后本机推送 GitHub 后，服务器只需执行：
+
+```sh
+workbench-update
+```
+
+命令会自动完成：检查源码干净且 main 可快进 → 获取 Git 更新 → 在独立临时目录安装依赖、构建并测试 → 停服 → 备份 SQLite 和图片 → 快进源码 → 使用已缓存依赖离线安装构建 → 启动并检查本机登录页。获取更新和预检查期间原服务继续运行，只有切换阶段短暂停服。脚本以 systemd 中的服务用户执行 Git / npm，避免生成 root 所有的项目文件；不会更改 Nginx、证书或现有 systemd 环境配置。
+
+如服务器连接 GitHub 失败，可上传 Git bundle 后执行：
+
+```sh
+workbench-update /实际位置/更新包.bundle
+```
+
+脚本会将包复制到临时可读位置，因此 root 目录中的上传包也可使用；bundle 必须适用于当前 Git 历史，并包含 `main` 分支。已手动拉取代码但还未重启时，使用 `workbench-update --restart` 重新构建、备份并启动；普通无更新场景则直接退出。
+
+### 备份及失败处理
+
+- 数据备份位于 `/var/backups/department-plan-workbench/update-时间-随机编号/data.tar`，并记录切换前后提交编号。备份发生在停服后，保留数据库与图片，不递归复制运行目录内已有的 `backups/` 历史备份。只有出现 `backup-complete.txt` 的更新目录才表示归档步骤完成。备份含敏感业务信息，仅在服务器保存，需定期人工清理和转存。
+- 网络、依赖或测试失败不会停止原服务；脏工作区、分支分歧或另一个更新正在运行时拒绝操作。停服后备份失败会请求恢复原服务。
+- 源码切换、正式目录构建或新版启动失败时，服务保持停止并保留备份及本机诊断日志。新版可能已做数据库迁移，因此不自动用旧代码启动，也不自动恢复数据库；应人工核对备份，按对应版本的恢复说明处理。
+- 健康检查为本机 Node 登录页和 systemd 运行状态。更新成功后仍应打开实际 HTTPS 网站验证业务功能；它不代替证书、域名或 Nginx 检查。
+- 当前脚本读取 systemd 直接配置的 `DATA_DIR` 和 `PORT`，要求数据目录为含现有数据库的绝对路径、服务目录与源码目录一致、服务用户非 root。使用 `EnvironmentFile` 或其他启动结构的部署会停止并提示人工核对。
+- 整个更新进程持有独占锁，脚本自身使用临时副本运行，避免更新脚本被替换后执行混杂内容。失败诊断日志保留在同一备份根目录下的 `failed-...`；不会将完整环境变量输出到终端。
+
+默认服务名为 `department-plan-workbench`。定制部署可以通过 `WORKBENCH_PROJECT_DIR`、`WORKBENCH_SERVICE`、`WORKBENCH_BACKUP_DIR`、`WORKBENCH_COMMAND_PATH`、`WORKBENCH_LOCK_FILE` 指定本机路径或服务名；不要把凭据放入这些变量或脚本。脚本适用于本项目的单实例更新，不支持自动切换 Node 版本、修改系统配置或跨机器部署。
 
 ## 项目结构
 
@@ -178,6 +215,7 @@ department-plan-workbench/
 ├── src/permissions.js        组织上下级、人员权限并集与服务端筛选
 ├── src/rich-text.js          HTML 白名单过滤源码
 ├── scripts/build-vendor.mjs  本地资源复制和浏览器模块构建
+├── scripts/update-server.sh  Linux 服务器备份、检查与更新命令
 ├── data/uploads/             上传图片，需与业务数据一起备份
 ├── data/workbench.sqlite     首次启动自动创建的数据库
 ├── test/                    核心流程、持久化与富文本安全测试

@@ -2,6 +2,12 @@
 
 > 新记录写在最上面。每次修改前先读本文件，修改后追加一条。规则见 `AGENTS.md`。
 
+## 2026-11-17 19:07（来源：Codex 应用）
+- 改动内容：新增 Linux/systemd 服务器一条命令更新脚本，首次安装快捷命令后使用 `workbench-update` 自动获取 Git 或 bundle、独立目录构建测试、停服备份数据库与图片、快进切换、缓存离线构建、启动检查；自动使用服务用户和现有数据目录，保留 Nginx / 证书 / 服务环境。支持更新锁、脏工作区与分支分歧保护、脚本自身临时副本、备份失败恢复旧服务、切换后失败保留备份与诊断日志，不自动回退已迁移数据库。
+- 涉及文件：`scripts/update-server.sh`、`test/update-server.test.js`、`README.md`、`CHANGELOG.md`
+- 测试情况：独立源码目录实际联网 npm ci 与同缓存 npm ci --offline 均成功；npm test 全部通过（21 项，0 失败）；新增 4 组流程测试使用真实临时 Git 仓库和数据归档，模拟 systemd / sudo / npm / 健康检查，覆盖正常、无更新、bundle、网络 / 测试 / 备份 / 构建 / 启动失败、未提交修改、分歧、锁、快捷命令安装及强制重启；bash -n 与 git diff --check 通过。
+- 未完成 / 待办：仅本地提交，未推送；服务器尚需首次同步脚本并安装快捷命令，未远程操作云服务、真实数据或证书；真实 Linux systemd 部署仍需首次使用时验收。备份须维护者定期转存清理，迁移失败恢复仍需人工核对。
+
 ## 2026-11-17 08:20（来源：Codex CLI）
 - 改动内容：完成按组织层级与计划负责人隔离数据权限：本人与下级机构人员可见，多机构 / 跨层级取并集，平级隔离，管理员全量；服务端统一校验计划查询、详情、保存、删除及图片读取 / 引用，依据详情过滤关联计划。负责人改为系统用户、部门改为负责人所属机构，保留展示与 CSV 兼容字段；新增权限范围内组织 / 人员树、未归属入口、列表筛选联动与权限刷新。首次升级前自动完整备份数据（排除历史备份），事务匹配旧计划归属，失败回滚，不覆盖已绑定记录。
 - 涉及文件：`server.js`、`src/database.js`、`src/permissions.js`、`public/app.js`、`public/plan-tree.js`、`public/index.html`、`public/style.css`、`test/auth.test.js`、`test/plan-ui.test.js`、`test/workbench.test.js`、`README.md`、`CHANGELOG.md`。
